@@ -104,10 +104,9 @@ type VFS struct {
 	// Set to 0 to delete immediately after compaction.
 	L0Retention time.Duration
 
-	writeMu        sync.Mutex
-	writeFile      *VFSFile // current RESERVED lock holder (nil if none)
-	lastSyncedTXID ltx.TXID // highest TXID synced by any local connection
-	writeSeq       uint64   // atomic counter for unique buffer paths
+	writeMu     sync.Mutex
+	writeStates map[string]*vfsWriteState
+	writeSeq    uint64 // atomic counter for unique buffer paths
 
 	tempDirOnce sync.Once
 	tempDir     string
@@ -122,7 +121,16 @@ func NewVFS(client ReplicaClient, logger *slog.Logger) *VFS {
 		logger:       logger.With("vfs", "true"),
 		PollInterval: DefaultPollInterval,
 		CacheSize:    DefaultCacheSize,
+		writeStates:  make(map[string]*vfsWriteState),
 	}
+}
+
+// vfsWriteState coordinates connections that use the same database name.
+// Independent databases have independent LTX transaction ID sequences.
+type vfsWriteState struct {
+	writeFile      *VFSFile
+	lastSyncedTXID ltx.TXID
+	refs           int
 }
 
 func (vfs *VFS) Open(name string, flags sqlite3vfs.OpenFlag) (sqlite3vfs.File, sqlite3vfs.OpenFlag, error) {
@@ -258,7 +266,17 @@ func (vfs *VFS) openMainDB(name string, uriParameters map[string]string, flags s
 		}
 	}
 
+	vfs.writeMu.Lock()
+	f.writeState = vfs.writeStates[name]
+	if f.writeState == nil {
+		f.writeState = &vfsWriteState{}
+		vfs.writeStates[name] = f.writeState
+	}
+	f.writeState.refs++
+	vfs.writeMu.Unlock()
+
 	if err := f.Open(); err != nil {
+		vfs.releaseWriteState(f)
 		if perConnClient {
 			if closer, ok := client.(io.Closer); ok {
 				closer.Close()
@@ -267,13 +285,11 @@ func (vfs *VFS) openMainDB(name string, uriParameters map[string]string, flags s
 		return nil, 0, err
 	}
 
-	if writeEnabled {
-		vfs.writeMu.Lock()
-		if f.expectedTXID > vfs.lastSyncedTXID {
-			vfs.lastSyncedTXID = f.expectedTXID
-		}
-		vfs.writeMu.Unlock()
+	vfs.writeMu.Lock()
+	if writeEnabled && f.expectedTXID > f.writeState.lastSyncedTXID {
+		f.writeState.lastSyncedTXID = f.expectedTXID
 	}
+	vfs.writeMu.Unlock()
 
 	// When SQLite requests read-write access, always report ReadWrite in the
 	// output flags so that cold enable via PRAGMA litestream_write_enabled
@@ -290,6 +306,15 @@ func (vfs *VFS) openMainDB(name string, uriParameters map[string]string, flags s
 	}
 
 	return f, flags, nil
+}
+
+func (vfs *VFS) releaseWriteState(f *VFSFile) {
+	vfs.writeMu.Lock()
+	defer vfs.writeMu.Unlock()
+	f.writeState.refs--
+	if f.writeState.refs == 0 {
+		delete(vfs.writeStates, f.name)
+	}
 }
 
 func (vfs *VFS) configForOpen(name string, uriParameters map[string]string) (*VFSConfig, error) {
@@ -627,6 +652,7 @@ type VFSFile struct {
 	cond          *sync.Cond       // Signals transaction state changes
 
 	perConnClient bool // True when client was created from config registry (close on file close)
+	writeState    *vfsWriteState
 
 	hydrator            *Hydrator // Background hydration (nil if disabled)
 	hydrationPath       string    // Path for hydration file (set during Open)
@@ -1495,10 +1521,14 @@ func (f *VFSFile) Close() error {
 
 	if f.writeEnabled && f.vfs != nil {
 		f.vfs.writeMu.Lock()
-		if f.vfs.writeFile == f {
-			f.vfs.writeFile = nil
+		if f.writeState.writeFile == f {
+			f.writeState.writeFile = nil
 		}
 		f.vfs.writeMu.Unlock()
+	}
+
+	if f.vfs != nil && f.writeState != nil {
+		f.vfs.releaseWriteState(f)
 	}
 
 	if f.perConnClient {
@@ -2023,8 +2053,8 @@ func (f *VFSFile) syncToRemoteWithLock() error {
 
 	if f.vfs != nil {
 		f.vfs.writeMu.Lock()
-		if f.expectedTXID > f.vfs.lastSyncedTXID {
-			f.vfs.lastSyncedTXID = f.expectedTXID
+		if f.expectedTXID > f.writeState.lastSyncedTXID {
+			f.writeState.lastSyncedTXID = f.expectedTXID
 		}
 		f.vfs.writeMu.Unlock()
 	}
@@ -2301,14 +2331,14 @@ func (f *VFSFile) Lock(elock sqlite3vfs.LockType) error {
 	if f.writeEnabled && elock >= sqlite3vfs.LockReserved && !f.inTransaction {
 		if f.vfs != nil {
 			f.vfs.writeMu.Lock()
-			if f.vfs.writeFile != nil && f.vfs.writeFile != f {
+			if f.writeState.writeFile != nil && f.writeState.writeFile != f {
 				f.vfs.writeMu.Unlock()
 				return sqlite3vfs.BusyError
 			}
-			f.vfs.writeFile = f
-			if f.vfs.lastSyncedTXID > f.expectedTXID && len(f.dirty) == 0 {
-				f.expectedTXID = f.vfs.lastSyncedTXID
-				f.pendingTXID = f.vfs.lastSyncedTXID + 1
+			f.writeState.writeFile = f
+			if f.writeState.lastSyncedTXID > f.expectedTXID && len(f.dirty) == 0 {
+				f.expectedTXID = f.writeState.lastSyncedTXID
+				f.pendingTXID = f.writeState.lastSyncedTXID + 1
 				f.pos = ltx.Pos{TXID: f.expectedTXID}
 			}
 			f.vfs.writeMu.Unlock()
@@ -2335,8 +2365,8 @@ func (f *VFSFile) Unlock(elock sqlite3vfs.LockType) error {
 		f.inTransaction = false
 		if f.vfs != nil {
 			f.vfs.writeMu.Lock()
-			if f.vfs.writeFile == f {
-				f.vfs.writeFile = nil
+			if f.writeState.writeFile == f {
+				f.writeState.writeFile = nil
 			}
 			f.vfs.writeMu.Unlock()
 		}
@@ -2378,7 +2408,7 @@ func (f *VFSFile) CheckReservedLock() (bool, error) {
 	}
 	if f.vfs != nil {
 		f.vfs.writeMu.Lock()
-		held := f.vfs.writeFile != nil
+		held := f.writeState.writeFile != nil
 		f.vfs.writeMu.Unlock()
 		return held, nil
 	}
