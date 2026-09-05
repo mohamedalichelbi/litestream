@@ -103,6 +103,34 @@ func TestVFS_URIReplicaURL(t *testing.T) {
 	waitForReplicaValue(t, sqldb1, "SELECT * FROM t", 100, 10*time.Second, 25*time.Millisecond)
 }
 
+func TestVFS_WritableIndependentDatabases(t *testing.T) {
+	vfsName := registerTestVFS(t, newVFS(t, nil))
+
+	for _, name := range []string{"first", "second"} {
+		replicaDir := t.TempDir()
+		databasePath := filepath.ToSlash(filepath.Join(t.TempDir(), name+".db"))
+		bufferPath := filepath.ToSlash(filepath.Join(t.TempDir(), name+".buffer"))
+		dsn := fmt.Sprintf(
+			"file:%s?vfs=%s&replica_url=file://%s&write_enabled=true&sync_interval=1h&buffer_path=%s",
+			databasePath, vfsName, filepath.ToSlash(replicaDir), bufferPath)
+
+		db, err := sql.Open("sqlite3", dsn)
+		require.NoError(t, err)
+		_, err = db.Exec("CREATE TABLE items (value TEXT NOT NULL)")
+		require.NoError(t, err)
+		_, err = db.Exec("INSERT INTO items (value) VALUES (?)", name)
+		require.NoError(t, err)
+		require.NoError(t, db.Close())
+
+		db, err = sql.Open("sqlite3", dsn)
+		require.NoError(t, err)
+		var value string
+		require.NoError(t, db.QueryRow("SELECT value FROM items").Scan(&value))
+		require.Equal(t, name, value)
+		require.NoError(t, db.Close())
+	}
+}
+
 func TestVFS_Updating(t *testing.T) {
 	client := file.NewReplicaClient(t.TempDir())
 	vfs := newVFS(t, client)
