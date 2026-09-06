@@ -2041,6 +2041,14 @@ func (f *VFSFile) syncToRemoteWithLock() error {
 	if err != nil {
 		return fmt.Errorf("upload LTX: %w", err)
 	}
+	publishedIndex, err := FetchPageIndex(ctx, f.client, info)
+	if err != nil {
+		return fmt.Errorf("fetch published LTX index: %w", err)
+	}
+	publishedHeader, err := FetchLTXHeader(ctx, f.client, info)
+	if err != nil {
+		return fmt.Errorf("fetch published LTX header: %w", err)
+	}
 
 	f.logger.Info("synced to remote",
 		"txid", info.MaxTXID,
@@ -2050,6 +2058,19 @@ func (f *VFSFile) syncToRemoteWithLock() error {
 	f.expectedTXID = f.pendingTXID
 	f.pendingTXID++
 	f.pos = ltx.Pos{TXID: f.expectedTXID}
+
+	// Apply the state that the replica returned. Remove pages that a truncate
+	// made invalid.
+	f.commit = publishedHeader.Commit
+	for pgno := range f.index {
+		if pgno > f.commit {
+			delete(f.index, pgno)
+			f.cache.Remove(pgno)
+		}
+	}
+	for pgno, elem := range publishedIndex {
+		f.index[pgno] = elem
+	}
 
 	if f.vfs != nil {
 		f.vfs.writeMu.Lock()
@@ -2280,22 +2301,7 @@ func (f *VFSFile) FileSize() (size int64, err error) {
 	}
 
 	f.mu.Lock()
-	for pgno := range f.index {
-		if v := int64(pgno) * int64(pageSize); v > size {
-			size = v
-		}
-	}
-	for pgno := range f.pending {
-		if v := int64(pgno) * int64(pageSize); v > size {
-			size = v
-		}
-	}
-	// Include dirty pages in size calculation
-	for pgno := range f.dirty {
-		if v := int64(pgno) * int64(pageSize); v > size {
-			size = v
-		}
-	}
+	size = int64(f.commit) * int64(pageSize)
 	f.mu.Unlock()
 
 	f.logger.Debug("file size", "size", size)

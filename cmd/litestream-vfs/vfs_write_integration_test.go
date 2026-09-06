@@ -755,6 +755,36 @@ func TestVFS_SchemaChanges(t *testing.T) {
 	require.Error(t, err)
 }
 
+// TestVFS_SchemaGrowthBeforePoll verifies that a local sync updates the file
+// size and page index without help from the replica poller.
+func TestVFS_SchemaGrowthBeforePoll(t *testing.T) {
+	replicaDir := t.TempDir()
+	client := file.NewReplicaClient(replicaDir)
+
+	setupInitialDB(t, client)
+
+	vfs := newWritableVFS(t, client, 100*time.Millisecond, t.TempDir())
+	vfs.PollInterval = time.Hour
+	vfsName := fmt.Sprintf("litestream-schema-growth-%d", time.Now().UnixNano())
+	require.NoError(t, sqlite3vfs.RegisterVFS(vfsName, vfs))
+
+	sqldb, err := sql.Open("sqlite3", fmt.Sprintf("file:test.db?vfs=%s", vfsName))
+	require.NoError(t, err)
+	defer sqldb.Close()
+
+	_, err = sqldb.Exec("CREATE TABLE products (id INTEGER PRIMARY KEY, name TEXT)")
+	require.NoError(t, err)
+	_, err = sqldb.Exec("INSERT INTO products (id, name) VALUES (1, 'Widget')")
+	require.NoError(t, err)
+
+	time.Sleep(300 * time.Millisecond)
+
+	var name string
+	err = sqldb.QueryRow("SELECT name FROM products WHERE id = 1").Scan(&name)
+	require.NoError(t, err)
+	require.Equal(t, "Widget", name)
+}
+
 // TestVFS_BlobData tests large blob operations.
 func TestVFS_BlobData(t *testing.T) {
 	replicaDir := t.TempDir()
