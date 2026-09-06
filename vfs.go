@@ -125,12 +125,11 @@ func NewVFS(client ReplicaClient, logger *slog.Logger) *VFS {
 	}
 }
 
-// vfsWriteState coordinates connections that use the same database name.
-// Independent databases have independent LTX transaction ID sequences.
+// vfsWriteState prevents two writable connections from owning the same database.
+// Independent database names have independent owners.
 type vfsWriteState struct {
-	writeFile      *VFSFile
-	lastSyncedTXID ltx.TXID
-	refs           int
+	writeFile *VFSFile
+	refs      int
 }
 
 func (vfs *VFS) Open(name string, flags sqlite3vfs.OpenFlag) (sqlite3vfs.File, sqlite3vfs.OpenFlag, error) {
@@ -273,6 +272,22 @@ func (vfs *VFS) openMainDB(name string, uriParameters map[string]string, flags s
 		vfs.writeStates[name] = f.writeState
 	}
 	f.writeState.refs++
+	if writeEnabled {
+		if f.writeState.writeFile != nil {
+			f.writeState.refs--
+			if f.writeState.refs == 0 {
+				delete(vfs.writeStates, name)
+			}
+			vfs.writeMu.Unlock()
+			if perConnClient {
+				if closer, ok := client.(io.Closer); ok {
+					closer.Close()
+				}
+			}
+			return nil, 0, sqlite3vfs.BusyError
+		}
+		f.writeState.writeFile = f
+	}
 	vfs.writeMu.Unlock()
 
 	if err := f.Open(); err != nil {
@@ -284,12 +299,6 @@ func (vfs *VFS) openMainDB(name string, uriParameters map[string]string, flags s
 		}
 		return nil, 0, err
 	}
-
-	vfs.writeMu.Lock()
-	if writeEnabled && f.expectedTXID > f.writeState.lastSyncedTXID {
-		f.writeState.lastSyncedTXID = f.expectedTXID
-	}
-	vfs.writeMu.Unlock()
 
 	// When SQLite requests read-write access, always report ReadWrite in the
 	// output flags so that cold enable via PRAGMA litestream_write_enabled
@@ -311,6 +320,9 @@ func (vfs *VFS) openMainDB(name string, uriParameters map[string]string, flags s
 func (vfs *VFS) releaseWriteState(f *VFSFile) {
 	vfs.writeMu.Lock()
 	defer vfs.writeMu.Unlock()
+	if f.writeState.writeFile == f {
+		f.writeState.writeFile = nil
+	}
 	f.writeState.refs--
 	if f.writeState.refs == 0 {
 		delete(vfs.writeStates, f.name)
@@ -1916,6 +1928,13 @@ func (f *VFSFile) SetWriteEnabledWithTimeout(enabled bool, timeout time.Duration
 		}
 
 		f.writeEnabled = false
+		if f.vfs != nil {
+			f.vfs.writeMu.Lock()
+			if f.writeState.writeFile == f {
+				f.writeState.writeFile = nil
+			}
+			f.vfs.writeMu.Unlock()
+		}
 		f.disabling = false
 		f.cond.Broadcast() // Wake any Lock() calls waiting for disable to complete
 		f.logger.Info("write support disabled")
@@ -1924,7 +1943,6 @@ func (f *VFSFile) SetWriteEnabledWithTimeout(enabled bool, timeout time.Duration
 	}
 
 	// ENABLING writes (cold enable supported)
-
 	// Initialize dirty map if not present
 	if f.dirty == nil {
 		f.dirty = make(map[uint32]int64)
@@ -1969,6 +1987,17 @@ func (f *VFSFile) SetWriteEnabledWithTimeout(enabled bool, timeout time.Duration
 	if f.pendingTXID == 0 {
 		f.expectedTXID = f.pos.TXID
 		f.pendingTXID = f.pos.TXID + 1
+	}
+
+	if f.vfs != nil {
+		f.vfs.writeMu.Lock()
+		if f.writeState.writeFile != nil && f.writeState.writeFile != f {
+			f.vfs.writeMu.Unlock()
+			f.mu.Unlock()
+			return sqlite3vfs.BusyError
+		}
+		f.writeState.writeFile = f
+		f.vfs.writeMu.Unlock()
 	}
 
 	// Start sync ticker if not running and interval > 0
@@ -2070,14 +2099,6 @@ func (f *VFSFile) syncToRemoteWithLock() error {
 	}
 	for pgno, elem := range publishedIndex {
 		f.index[pgno] = elem
-	}
-
-	if f.vfs != nil {
-		f.vfs.writeMu.Lock()
-		if f.expectedTXID > f.writeState.lastSyncedTXID {
-			f.writeState.lastSyncedTXID = f.expectedTXID
-		}
-		f.vfs.writeMu.Unlock()
 	}
 
 	// Update cache with synced pages (index will be populated naturally when pages are fetched)
@@ -2337,15 +2358,9 @@ func (f *VFSFile) Lock(elock sqlite3vfs.LockType) error {
 	if f.writeEnabled && elock >= sqlite3vfs.LockReserved && !f.inTransaction {
 		if f.vfs != nil {
 			f.vfs.writeMu.Lock()
-			if f.writeState.writeFile != nil && f.writeState.writeFile != f {
+			if f.writeState.writeFile != f {
 				f.vfs.writeMu.Unlock()
 				return sqlite3vfs.BusyError
-			}
-			f.writeState.writeFile = f
-			if f.writeState.lastSyncedTXID > f.expectedTXID && len(f.dirty) == 0 {
-				f.expectedTXID = f.writeState.lastSyncedTXID
-				f.pendingTXID = f.writeState.lastSyncedTXID + 1
-				f.pos = ltx.Pos{TXID: f.expectedTXID}
 			}
 			f.vfs.writeMu.Unlock()
 		}
@@ -2369,13 +2384,6 @@ func (f *VFSFile) Unlock(elock sqlite3vfs.LockType) error {
 
 	if f.writeEnabled && f.inTransaction && elock < sqlite3vfs.LockReserved {
 		f.inTransaction = false
-		if f.vfs != nil {
-			f.vfs.writeMu.Lock()
-			if f.writeState.writeFile == f {
-				f.writeState.writeFile = nil
-			}
-			f.vfs.writeMu.Unlock()
-		}
 		f.logger.Debug("transaction ended", "dirtyPages", len(f.dirty))
 		f.cond.Broadcast() // Wake up SetWriteEnabledWithTimeout if waiting
 	}
@@ -2414,7 +2422,7 @@ func (f *VFSFile) CheckReservedLock() (bool, error) {
 	}
 	if f.vfs != nil {
 		f.vfs.writeMu.Lock()
-		held := f.writeState.writeFile != nil
+		held := f.writeState.writeFile != nil && f.writeState.writeFile != f
 		f.vfs.writeMu.Unlock()
 		return held, nil
 	}

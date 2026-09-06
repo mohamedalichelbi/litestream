@@ -596,6 +596,7 @@ func TestVFS_ReadWhileWriting(t *testing.T) {
 	sqldb, err := sql.Open("sqlite3", fmt.Sprintf("file:test.db?vfs=%s", vfsName))
 	require.NoError(t, err)
 	defer sqldb.Close()
+	sqldb.SetMaxOpenConns(1)
 
 	var wg sync.WaitGroup
 	errors := make(chan error, 10)
