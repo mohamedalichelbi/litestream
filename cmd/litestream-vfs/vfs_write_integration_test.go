@@ -785,6 +785,47 @@ func TestVFS_SchemaGrowthBeforePoll(t *testing.T) {
 	require.Equal(t, "Widget", name)
 }
 
+func TestVFS_DurabilityTicket(t *testing.T) {
+	replicaDir := t.TempDir()
+	client := file.NewReplicaClient(replicaDir)
+
+	setupInitialDB(t, client)
+
+	vfs := newWritableVFS(t, client, 100*time.Millisecond, t.TempDir())
+	vfsName := fmt.Sprintf("litestream-durability-ticket-%d", time.Now().UnixNano())
+	require.NoError(t, sqlite3vfs.RegisterVFS(vfsName, vfs))
+
+	sqldb, err := sql.Open("sqlite3", fmt.Sprintf("file:test.db?vfs=%s", vfsName))
+	require.NoError(t, err)
+	defer sqldb.Close()
+
+	var initialTXID, initialTicket int64
+	require.NoError(t, sqldb.QueryRow("PRAGMA litestream_txid").Scan(&initialTXID))
+	require.NoError(
+		t, sqldb.QueryRow("PRAGMA litestream_durability_ticket").Scan(&initialTicket))
+	require.Equal(t, initialTXID, initialTicket)
+
+	_, err = sqldb.Exec("CREATE TABLE products (id INTEGER PRIMARY KEY, name TEXT)")
+	require.NoError(t, err)
+
+	var pendingTicket int64
+	require.NoError(
+		t, sqldb.QueryRow("PRAGMA litestream_durability_ticket").Scan(&pendingTicket))
+	require.Greater(t, pendingTicket, initialTXID)
+
+	var durableTXID, durableTicket int64
+	require.Eventually(t, func() bool {
+		if err := sqldb.QueryRow("PRAGMA litestream_txid").Scan(&durableTXID); err != nil {
+			return false
+		}
+		return durableTXID == pendingTicket
+	}, time.Second, 10*time.Millisecond)
+	require.NoError(
+		t, sqldb.QueryRow("PRAGMA litestream_durability_ticket").Scan(&durableTicket))
+	require.Equal(t, pendingTicket, durableTXID)
+	require.Equal(t, durableTXID, durableTicket)
+}
+
 // TestVFS_BlobData tests large blob operations.
 func TestVFS_BlobData(t *testing.T) {
 	replicaDir := t.TempDir()

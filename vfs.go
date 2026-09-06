@@ -2478,6 +2478,19 @@ func (f *VFSFile) FileControl(op int, pragmaName string, pragmaValue *string) (*
 		result := txid.String()
 		return &result, nil
 
+	case "litestream_durability_ticket":
+		if pragmaValue != nil {
+			return nil, fmt.Errorf("litestream_durability_ticket is read-only")
+		}
+		f.mu.Lock()
+		txid := f.expectedTXID
+		if len(f.dirty) != 0 {
+			txid = f.pendingTXID
+		}
+		f.mu.Unlock()
+		result := txid.String()
+		return &result, nil
+
 	case "litestream_lag":
 		if pragmaValue != nil {
 			return nil, fmt.Errorf("litestream_lag is read-only")
