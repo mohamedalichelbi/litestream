@@ -27,7 +27,7 @@ static void litestream_time_impl(sqlite3_context* ctx, int argc, sqlite3_value**
 static void litestream_txid_impl(sqlite3_context* ctx, int argc, sqlite3_value** argv);
 static void litestream_lag_impl(sqlite3_context* ctx, int argc, sqlite3_value** argv);
 static void litestream_function_destroy(void* db);
-static void litestream_auto_extension(sqlite3* db, const char** pzErrMsg, const struct sqlite3_api_routines* pApi);
+static int litestream_auto_extension(sqlite3* db, char** pzErrMsg, const struct sqlite3_api_routines* pApi);
 
 /* This routine is called when the extension is loaded. */
 int sqlite3_litestreamvfs_init(sqlite3 *db, char **pzErrMsg, const sqlite3_api_routines *pApi) {
@@ -56,21 +56,32 @@ int sqlite3_litestreamvfs_init(sqlite3 *db, char **pzErrMsg, const sqlite3_api_r
   return rc;
 }
 
-static void litestream_auto_extension(sqlite3* db, const char** pzErrMsg, const struct sqlite3_api_routines* pApi) {
+static int litestream_auto_extension(sqlite3* db, char** pzErrMsg, const struct sqlite3_api_routines* pApi) {
   (void)pzErrMsg;
   (void)pApi;
 
-  if (litestream_register_connection(db) != SQLITE_OK) {
-    return;
+  int rc = litestream_register_connection(db);
+  if (rc == SQLITE_DONE) {
+    /* A connection that uses another VFS needs no Litestream functions. */
+    return SQLITE_OK;
+  }
+  if (rc != SQLITE_OK) {
+    return rc;
   }
 
   /* litestream_set_time(timestamp) - for time travel */
-  sqlite3_create_function_v2(db, "litestream_set_time", 1, SQLITE_UTF8 | SQLITE_DIRECTONLY, db, litestream_set_time_impl, 0, 0, litestream_function_destroy);
+  rc = sqlite3_create_function_v2(db, "litestream_set_time", 1, SQLITE_UTF8 | SQLITE_DIRECTONLY, db, litestream_set_time_impl, 0, 0, litestream_function_destroy);
+  if (rc != SQLITE_OK) return rc;
 
   /* Read-only functions: litestream_time(), litestream_txid(), litestream_lag() */
-  sqlite3_create_function_v2(db, "litestream_time", 0, SQLITE_UTF8, db, litestream_time_impl, 0, 0, 0);
-  sqlite3_create_function_v2(db, "litestream_txid", 0, SQLITE_UTF8, db, litestream_txid_impl, 0, 0, 0);
-  sqlite3_create_function_v2(db, "litestream_lag", 0, SQLITE_UTF8, db, litestream_lag_impl, 0, 0, 0);
+  rc = sqlite3_create_function_v2(db, "litestream_time", 0, SQLITE_UTF8, db, litestream_time_impl, 0, 0, 0);
+  if (rc != SQLITE_OK) return rc;
+  rc = sqlite3_create_function_v2(db, "litestream_txid", 0, SQLITE_UTF8, db, litestream_txid_impl, 0, 0, 0);
+  if (rc != SQLITE_OK) return rc;
+  rc = sqlite3_create_function_v2(db, "litestream_lag", 0, SQLITE_UTF8, db, litestream_lag_impl, 0, 0, 0);
+  if (rc != SQLITE_OK) return rc;
+
+  return SQLITE_OK;
 }
 
 static int litestream_register_connection(sqlite3* db) {
