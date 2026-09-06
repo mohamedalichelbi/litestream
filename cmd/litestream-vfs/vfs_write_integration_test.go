@@ -812,6 +812,12 @@ func TestVFS_DurabilityTicket(t *testing.T) {
 	require.NoError(
 		t, sqldb.QueryRow("PRAGMA litestream_durability_ticket").Scan(&pendingTicket))
 	require.Greater(t, pendingTicket, initialTXID)
+	_, err = sqldb.Exec("INSERT INTO products (id, name) VALUES (1, 'Widget')")
+	require.NoError(t, err)
+	var batchedTicket int64
+	require.NoError(
+		t, sqldb.QueryRow("PRAGMA litestream_durability_ticket").Scan(&batchedTicket))
+	require.Equal(t, pendingTicket, batchedTicket)
 
 	var durableTXID, durableTicket int64
 	require.Eventually(t, func() bool {
