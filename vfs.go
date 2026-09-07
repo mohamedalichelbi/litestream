@@ -2055,6 +2055,15 @@ func (f *VFSFile) syncToRemoteWithLock() error {
 		return nil
 	}
 
+	// SQLite can leave buffered pages beyond the current database size when a
+	// later transaction truncates the file. These pages are no longer part of
+	// the database and LTX files must not contain pages beyond their commit size.
+	for pgno := range f.dirty {
+		if pgno > f.commit {
+			delete(f.dirty, pgno)
+		}
+	}
+
 	ctx := f.ctx
 
 	// Check for conflicts

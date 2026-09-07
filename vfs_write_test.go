@@ -479,6 +479,54 @@ func TestVFSFile_Truncate(t *testing.T) {
 	}
 }
 
+func TestVFSFile_SyncIgnoresBufferedPagesBeyondCommit(t *testing.T) {
+	client := newWriteTestReplicaClient()
+
+	pageSize := uint32(4096)
+	page1 := make([]byte, pageSize)
+	page2 := make([]byte, pageSize)
+	createTestLTXFile(t, client, 1, pageSize, 2, map[uint32][]byte{1: page1, 2: page2})
+
+	f := setupWriteableVFSFile(t, client)
+	if err := f.Open(); err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+
+	if _, err := f.WriteAt([]byte("stale page"), int64(pageSize)); err != nil {
+		t.Fatal(err)
+	}
+	f.mu.Lock()
+	f.commit = 1
+	f.mu.Unlock()
+
+	if err := f.Sync(0); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := f.dirty[2]; ok {
+		t.Fatal("expected page beyond commit to be removed")
+	}
+	files := client.ltxFiles[0]
+	info := files[len(files)-1]
+	if got, want := info.MaxTXID, ltx.TXID(2); got != want {
+		t.Fatalf("last txid=%s, want %s", got, want)
+	}
+	header, err := FetchLTXHeader(context.Background(), client, info)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := header.Commit, uint32(1); got != want {
+		t.Fatalf("commit=%d, want %d", got, want)
+	}
+	index, err := FetchPageIndex(context.Background(), client, info)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := index[2]; ok {
+		t.Fatal("published page beyond commit")
+	}
+}
+
 func TestVFSFile_WriteBuffer(t *testing.T) {
 	client := newWriteTestReplicaClient()
 
