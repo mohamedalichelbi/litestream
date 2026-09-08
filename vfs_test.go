@@ -827,6 +827,34 @@ func TestVFSFile_PollingCancelsBlockedLTXFiles(t *testing.T) {
 	}
 }
 
+func TestVFSFile_BuildIndexFetchesFilesConcurrently(t *testing.T) {
+	base := newMockReplicaClient()
+	first := buildLTXFixtureWithPage(t, 1, DefaultPageSize, 1, 'a')
+	second := buildLTXFixtureWithPage(t, 2, DefaultPageSize, 2, 'b')
+	base.addFixture(t, first)
+	base.addFixture(t, second)
+
+	client := newConcurrentOpenReplicaClient(base)
+	f := NewVFSFile(client, "concurrent.db", slog.Default())
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	index, err := f.buildIndexMap(ctx, []*ltx.FileInfo{first.info, second.info})
+	if err != nil {
+		t.Fatalf("build index: %v", err)
+	}
+	if len(index) != 2 {
+		t.Fatalf("index page count=%d, want 2", len(index))
+	}
+	if got := client.maxActive.Load(); got < 2 {
+		t.Fatalf("maximum concurrent reads=%d, want at least 2", got)
+	} else if got > defaultRemoteReadConcurrency {
+		t.Fatalf("maximum concurrent reads=%d, want at most %d", got, defaultRemoteReadConcurrency)
+	}
+	if f.commit != 2 {
+		t.Fatalf("commit=%d, want 2", f.commit)
+	}
+}
+
 // mockReplicaClient implements ReplicaClient for deterministic LTX fixtures.
 type mockReplicaClient struct {
 	mu    sync.Mutex
@@ -839,6 +867,14 @@ type blockingReplicaClient struct {
 	blockNext atomic.Bool
 	blocked   chan struct{}
 	cancelled atomic.Bool
+	once      sync.Once
+}
+
+type concurrentOpenReplicaClient struct {
+	*mockReplicaClient
+	active    atomic.Int64
+	maxActive atomic.Int64
+	release   chan struct{}
 	once      sync.Once
 }
 
@@ -880,6 +916,30 @@ func newBlockingReplicaClient() *blockingReplicaClient {
 		mockReplicaClient: newMockReplicaClient(),
 		blocked:           make(chan struct{}),
 	}
+}
+
+func newConcurrentOpenReplicaClient(client *mockReplicaClient) *concurrentOpenReplicaClient {
+	return &concurrentOpenReplicaClient{mockReplicaClient: client, release: make(chan struct{})}
+}
+
+func (c *concurrentOpenReplicaClient) OpenLTXFile(ctx context.Context, level int, minTXID, maxTXID ltx.TXID, offset, size int64) (io.ReadCloser, error) {
+	current := c.active.Add(1)
+	defer c.active.Add(-1)
+	for {
+		maximum := c.maxActive.Load()
+		if current <= maximum || c.maxActive.CompareAndSwap(maximum, current) {
+			break
+		}
+	}
+	if current >= 2 {
+		c.once.Do(func() { close(c.release) })
+	}
+	select {
+	case <-c.release:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	return c.mockReplicaClient.OpenLTXFile(ctx, level, minTXID, maxTXID, offset, size)
 }
 
 func (c *mockReplicaClient) Type() string { return "mock" }

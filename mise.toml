@@ -1,0 +1,38 @@
+[tools]
+clang = "22.1.8"
+go = "1.25.14"
+
+[env]
+CC = "clang"
+CGO_ENABLED = "1"
+GOCACHE = "{{ config_root }}/.cache/go-build"
+GOMODCACHE = "{{ config_root }}/.cache/go-mod"
+
+[tasks.format]
+description = "Format Go source files."
+run = "go fmt ./..."
+
+[tasks.test]
+description = "Run the Go test suite."
+run = "go test ./..."
+
+[tasks.test-race]
+description = "Run the Go test suite with the race detector."
+run = "go test -race ./..."
+
+[tasks.vfs-test]
+description = "Run the writable VFS test suite."
+run = '''
+go test ./...
+go test -tags='vfs,SQLITE3VFS_LOADABLE_EXT' .
+go test -tags=vfs ./cmd/litestream-vfs
+'''
+
+[tasks.vfs-build-linux-amd64]
+description = "Build the Linux AMD64 writable VFS extension."
+run = '''
+mkdir -p dist
+go build -tags='vfs,SQLITE3VFS_LOADABLE_EXT' -o dist/litestream-vfs-linux-amd64.a -buildmode=c-archive ./cmd/litestream-vfs
+cp dist/litestream-vfs-linux-amd64.h src/litestream-vfs.h
+clang -DSQLITE3VFS_LOADABLE_EXT -g -fPIC -shared -o dist/litestream-vfs-linux-amd64.so src/litestream-vfs.c dist/litestream-vfs-linux-amd64.a -lpthread -ldl -lm
+'''

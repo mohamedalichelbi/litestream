@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/superfly/ltx"
+	"golang.org/x/sync/errgroup"
 	"golang.org/x/sync/semaphore"
 
 	"github.com/benbjohnson/litestream/internal"
@@ -23,11 +24,14 @@ import (
 
 // Default replica settings.
 const (
-	DefaultSyncInterval    = 1 * time.Second
-	DefaultMaxSyncLTXFiles = 256
+	DefaultSyncInterval          = 1 * time.Second
+	DefaultMaxSyncLTXFiles       = 256
+	defaultRemoteReadConcurrency = 8
 )
 
 var errReplicaWaitForData = errors.New("no position, waiting for data")
+
+var remoteReadSemaphore = semaphore.NewWeighted(defaultRemoteReadConcurrency)
 
 // Replica connects a database to a replication destination via a ReplicaClient.
 // The replica manages periodic synchronization and maintaining the current
@@ -1519,15 +1523,14 @@ func CalcRestorePlan(ctx context.Context, client ReplicaClient, txID ltx.TXID, t
 	var infos ltx.FileInfoSlice
 	logger = logger.With("target", txID)
 
-	// Start with latest snapshot before target TXID or timestamp.
-	// Pass useMetadata flag to enable accurate timestamp fetching for timestamp-based restore.
-	var snapshot *ltx.FileInfo
-	snapshotItr, err := client.LTXFiles(ctx, SnapshotLevel, 0, !timestamp.IsZero())
+	levelInfos, err := listRestoreFiles(ctx, client, !timestamp.IsZero())
 	if err != nil {
 		return nil, err
 	}
-	for snapshotItr.Next() {
-		info := snapshotItr.Item()
+
+	// Start with latest snapshot before target TXID or timestamp.
+	var snapshot *ltx.FileInfo
+	for _, info := range levelInfos[SnapshotLevel] {
 		logger.Debug("finding snapshot before target TXID or timestamp", "snapshot", info.MaxTXID)
 		if txID != 0 && info.MaxTXID > txID {
 			continue
@@ -1536,9 +1539,6 @@ func CalcRestorePlan(ctx context.Context, client ReplicaClient, txID ltx.TXID, t
 			continue
 		}
 		snapshot = info
-	}
-	if err := snapshotItr.Close(); err != nil {
-		return nil, err
 	}
 	if snapshot != nil {
 		logger.Debug("found snapshot before target TXID or timestamp", "snapshot", snapshot.MaxTXID)
@@ -1557,12 +1557,8 @@ func CalcRestorePlan(ctx context.Context, client ReplicaClient, txID ltx.TXID, t
 	cursors := make([]*restoreLevelCursor, 0, maxLevel+1)
 	for level := maxLevel; level >= 0; level-- {
 		logger.Debug("finding ltx files for level", "level", level)
-		itr, err := client.LTXFiles(ctx, level, 0, !timestamp.IsZero())
-		if err != nil {
-			return nil, err
-		}
 		cursors = append(cursors, &restoreLevelCursor{
-			itr: itr,
+			itr: ltx.NewFileInfoSliceIterator(levelInfos[level]),
 		})
 	}
 	defer func() {
@@ -1627,6 +1623,44 @@ func CalcRestorePlan(ctx context.Context, client ReplicaClient, txID ltx.TXID, t
 	}
 
 	return infos, nil
+}
+
+func listRestoreFiles(ctx context.Context, client ReplicaClient, useMetadata bool) ([][]*ltx.FileInfo, error) {
+	levelInfos := make([][]*ltx.FileInfo, SnapshotLevel+1)
+	g, ctx := errgroup.WithContext(ctx)
+
+	for level := 0; level <= SnapshotLevel; level++ {
+		level := level
+		g.Go(func() error {
+			if err := remoteReadSemaphore.Acquire(ctx, 1); err != nil {
+				return err
+			}
+			defer remoteReadSemaphore.Release(1)
+
+			itr, err := client.LTXFiles(ctx, level, 0, useMetadata)
+			if err != nil {
+				return fmt.Errorf("list level %d ltx files: %w", level, err)
+			}
+
+			var infos []*ltx.FileInfo
+			for itr.Next() {
+				info := *itr.Item()
+				infos = append(infos, &info)
+			}
+			iterErr := itr.Err()
+			closeErr := itr.Close()
+			if iterErr != nil || closeErr != nil {
+				return fmt.Errorf("list level %d ltx files: %w", level, errors.Join(iterErr, closeErr))
+			}
+			levelInfos[level] = infos
+			return nil
+		})
+	}
+
+	if err := g.Wait(); err != nil {
+		return nil, err
+	}
+	return levelInfos, nil
 }
 
 type restoreLevelCursor struct {

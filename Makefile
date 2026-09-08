@@ -31,7 +31,7 @@ vfs-linux-amd64:
 	CGO_ENABLED=1 GOOS=linux GOARCH=amd64 \
 		go build -tags $(VFS_BUILD_TAGS) -o dist/litestream-vfs-linux-amd64.a -buildmode=c-archive $(VFS_SRC)
 	cp dist/litestream-vfs-linux-amd64.h src/litestream-vfs.h
-	gcc -DSQLITE3VFS_LOADABLE_EXT -g -fPIC -shared -o dist/litestream-vfs-linux-amd64.so \
+	$(CC) -DSQLITE3VFS_LOADABLE_EXT -g -fPIC -shared -o dist/litestream-vfs-linux-amd64.so \
 		$(VFS_C_SRC) dist/litestream-vfs-linux-amd64.a $(LINUX_LDFLAGS)
 
 .PHONY: vfs-linux-arm64

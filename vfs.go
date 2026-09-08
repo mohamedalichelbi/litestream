@@ -24,6 +24,7 @@ import (
 	lru "github.com/hashicorp/golang-lru/v2"
 	"github.com/markusmobius/go-dateparser"
 	"github.com/superfly/ltx"
+	"golang.org/x/sync/errgroup"
 
 	"github.com/psanford/sqlite3vfs"
 )
@@ -1372,27 +1373,47 @@ func maxLevelTXID(infos []*ltx.FileInfo, level int) ltx.TXID {
 
 // buildIndexMap constructs a lookup of pgno to LTX file offsets.
 func (f *VFSFile) buildIndexMap(ctx context.Context, infos []*ltx.FileInfo) (map[uint32]ltx.PageIndexElem, error) {
+	type indexFile struct {
+		index  map[uint32]ltx.PageIndexElem
+		commit uint32
+	}
+
+	files := make([]indexFile, len(infos))
+	g, ctx := errgroup.WithContext(ctx)
+	for i, info := range infos {
+		i, info := i, info
+		g.Go(func() error {
+			if err := remoteReadSemaphore.Acquire(ctx, 1); err != nil {
+				return err
+			}
+			defer remoteReadSemaphore.Release(1)
+
+			f.logger.Debug("opening page index", "level", info.Level, "min", info.MinTXID, "max", info.MaxTXID)
+			idx, err := FetchPageIndex(ctx, f.client, info)
+			if err != nil {
+				return fmt.Errorf("fetch page index: %w", err)
+			}
+			hdr, err := FetchLTXHeader(ctx, f.client, info)
+			if err != nil {
+				return fmt.Errorf("fetch header: %w", err)
+			}
+			files[i] = indexFile{index: idx, commit: hdr.Commit}
+			return nil
+		})
+	}
+	if err := g.Wait(); err != nil {
+		return nil, err
+	}
+
 	index := make(map[uint32]ltx.PageIndexElem)
 	var commit uint32
-	for _, info := range infos {
-		f.logger.Debug("opening page index", "level", info.Level, "min", info.MinTXID, "max", info.MaxTXID)
-
-		// Read page index.
-		idx, err := FetchPageIndex(ctx, f.client, info)
-		if err != nil {
-			return nil, fmt.Errorf("fetch page index: %w", err)
-		}
-
+	for _, file := range files {
 		// Replace pages in overall index with new pages.
-		for k, v := range idx {
+		for k, v := range file.index {
 			f.logger.Debug("adding page index", "page", k, "elem", v)
 			index[k] = v
 		}
-		hdr, err := FetchLTXHeader(ctx, f.client, info)
-		if err != nil {
-			return nil, fmt.Errorf("fetch header: %w", err)
-		}
-		commit = hdr.Commit
+		commit = file.commit
 	}
 
 	f.mu.Lock()

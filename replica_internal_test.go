@@ -11,6 +11,8 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -138,6 +140,52 @@ func TestReplica_ApplyNewLTXFiles_IteratorCloseError(t *testing.T) {
 	}
 	if got, want := err.Error(), "level 0 listing failed"; !bytes.Contains([]byte(got), []byte(want)) {
 		t.Fatalf("error=%q, want substring %q", got, want)
+	}
+}
+
+func TestCalcRestorePlan_ListsLevelsConcurrently(t *testing.T) {
+	var active, maxActive atomic.Int64
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+
+	client := &followTestReplicaClient{}
+	client.LTXFilesFunc = func(ctx context.Context, level int, _ ltx.TXID, _ bool) (ltx.FileIterator, error) {
+		current := active.Add(1)
+		defer active.Add(-1)
+		for {
+			maximum := maxActive.Load()
+			if current <= maximum || maxActive.CompareAndSwap(maximum, current) {
+				break
+			}
+		}
+		if current >= 2 {
+			releaseOnce.Do(func() { close(release) })
+		}
+		select {
+		case <-release:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+
+		if level == 0 {
+			return ltx.NewFileInfoSliceIterator([]*ltx.FileInfo{{Level: 0, MinTXID: 1, MaxTXID: 1}}), nil
+		}
+		return ltx.NewFileInfoSliceIterator(nil), nil
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	plan, err := CalcRestorePlan(ctx, client, 1, time.Time{}, slog.Default())
+	if err != nil {
+		t.Fatalf("calculate restore plan: %v", err)
+	}
+	if len(plan) != 1 || plan[0].MaxTXID != 1 {
+		t.Fatalf("plan=%v, want one file through TXID 1", plan)
+	}
+	if got := maxActive.Load(); got < 2 {
+		t.Fatalf("maximum concurrent listings=%d, want at least 2", got)
+	} else if got > defaultRemoteReadConcurrency {
+		t.Fatalf("maximum concurrent listings=%d, want at most %d", got, defaultRemoteReadConcurrency)
 	}
 }
 
