@@ -42,6 +42,13 @@ go test -race -tags='vfs,SQLITE3VFS_LOADABLE_EXT' -run '^TestVFSFile_CloseErrors
 go test -race -tags=vfs -run '^TestVFS_SQLiteCloseDoesNotConfirmPersistence$' -count=1 -timeout=30s ./cmd/litestream-vfs
 '''
 
+[tasks.vfs-poll-order-test]
+description = "Check poll ordering against dirty writes, sync, and truncation."
+run = '''
+go test -race -tags='vfs,SQLITE3VFS_LOADABLE_EXT' -run '^TestVFSFile_Poll(CannotUndoLocalSync|PreservesUnsynchronizedPages)$' -count=10 -timeout=30s .
+go test -race -tags=vfs -run '^TestVFS_Truncate$' -count=50 -timeout=2m ./cmd/litestream-vfs
+'''
+
 [tasks.vfs-build-linux-amd64]
 description = "Build the Linux AMD64 writable VFS extension."
 run = '''

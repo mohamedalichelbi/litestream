@@ -2732,16 +2732,20 @@ func (f *VFSFile) monitorReplicaClient(ctx context.Context) {
 // pollReplicaClient fetches new LTX files from the replica client and updates
 // the page index & the current position.
 func (f *VFSFile) pollReplicaClient(ctx context.Context) error {
-	pos := f.Pos()
-	f.logger.Debug("polling replica client", "txid", pos.TXID.String())
-
-	combined := make(map[uint32]ltx.PageIndexElem)
-
 	f.mu.Lock()
-	baseCommit := f.commit
+	// Local writes can change the page count before the bucket has those pages.
+	if f.writeEnabled && (f.inTransaction || len(f.dirty) > 0) {
+		f.mu.Unlock()
+		return nil
+	}
+	pos := f.pos
+	startCommit := f.commit
 	maxTXID1Snapshot := f.maxTXID1
 	f.mu.Unlock()
 
+	f.logger.Debug("polling replica client", "txid", pos.TXID.String())
+	combined := make(map[uint32]ltx.PageIndexElem)
+	baseCommit := startCommit
 	newCommit := baseCommit
 	replaceIndex := false
 
@@ -2787,6 +2791,12 @@ func (f *VFSFile) pollReplicaClient(ctx context.Context) error {
 	// Send updates to a pending list if there are active readers.
 	f.mu.Lock()
 	defer f.mu.Unlock()
+
+	// Discard stale results if local state changed during the bucket requests.
+	if f.pos != pos || f.commit != startCommit || f.maxTXID1 != maxTXID1Snapshot ||
+		(f.writeEnabled && (f.inTransaction || len(f.dirty) > 0)) {
+		return nil
+	}
 
 	if f.targetTime != nil {
 		// Skip applying updates while time travel is active to avoid

@@ -459,6 +459,101 @@ type syncFailureReplicaClient struct {
 	failUpload bool
 }
 
+type heldPollClient struct {
+	*writeTestReplicaClient
+	hold    atomic.Bool
+	started chan struct{}
+	release chan struct{}
+}
+
+func (c *heldPollClient) LTXFiles(ctx context.Context, level int, seek ltx.TXID, metadata bool) (ltx.FileIterator, error) {
+	itr, err := c.writeTestReplicaClient.LTXFiles(ctx, level, seek, metadata)
+	if err == nil && level == 0 && c.hold.CompareAndSwap(true, false) {
+		close(c.started)
+		select {
+		case <-c.release:
+		case <-ctx.Done():
+			_ = itr.Close()
+			return nil, ctx.Err()
+		}
+	}
+	return itr, err
+}
+
+func TestVFSFile_PollCannotUndoLocalSync(t *testing.T) {
+	base := newWriteTestReplicaClient()
+	pages := make(map[uint32][]byte)
+	for pgno := uint32(1); pgno <= 4; pgno++ {
+		pages[pgno] = bytes.Repeat([]byte{byte(pgno)}, DefaultPageSize)
+	}
+	createTestLTXFile(t, base, 1, DefaultPageSize, 4, pages)
+	client := &heldPollClient{writeTestReplicaClient: base, started: make(chan struct{}), release: make(chan struct{})}
+	v := NewVFS(client, slog.Default())
+	v.WriteEnabled = true
+	v.PollInterval = time.Hour
+	v.WriteSyncInterval = time.Hour
+	f := openWriteVFSFile(t, v)
+	client.hold.Store(true)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- f.pollReplicaClient(ctx) }()
+	select {
+	case <-client.started:
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+	_, err := f.WriteAt(bytes.Repeat([]byte{5}, DefaultPageSize), 4*DefaultPageSize)
+	if err == nil {
+		err = f.Sync(0)
+	}
+	close(client.release)
+	if pollErr := <-done; pollErr != nil {
+		t.Fatal(pollErr)
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := f.Pos().TXID; got != 2 {
+		t.Fatalf("poll replaced synchronized TXID 2 with %s", got)
+	}
+	f.cache.Purge()
+	for pgno := uint32(2); pgno <= 5; pgno++ {
+		page := make([]byte, DefaultPageSize)
+		if _, err := f.ReadAt(page, int64(pgno-1)*DefaultPageSize); err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(page, bytes.Repeat([]byte{byte(pgno)}, DefaultPageSize)) {
+			t.Fatalf("poll lost page %d", pgno)
+		}
+	}
+}
+
+func TestVFSFile_PollPreservesUnsynchronizedPages(t *testing.T) {
+	base := newWriteTestReplicaClient()
+	page := bytes.Repeat([]byte{'a'}, DefaultPageSize)
+	createTestLTXFile(t, base, 1, DefaultPageSize, 1, map[uint32][]byte{1: page})
+	v := NewVFS(base, slog.Default())
+	v.WriteEnabled = true
+	v.PollInterval = time.Hour
+	v.WriteSyncInterval = time.Hour
+	f := openWriteVFSFile(t, v)
+	if _, err := f.WriteAt(page, DefaultPageSize); err != nil {
+		t.Fatal(err)
+	}
+	// A foreign writer must cause a sync conflict, not replace local dirty state.
+	createTestLTXFile(t, base, 2, DefaultPageSize, 1, map[uint32][]byte{1: page})
+	if err := f.pollReplicaClient(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if f.Pos().TXID != 1 || f.commit != 2 || len(f.dirty) != 1 {
+		t.Fatal("poll changed unsynchronized state")
+	}
+	if err := f.Sync(0); !errors.Is(err, ErrConflict) {
+		t.Fatalf("expected a foreign-writer conflict, got %v", err)
+	}
+}
+
 func (c *syncFailureReplicaClient) OpenLTXFile(ctx context.Context, level int, minTXID, maxTXID ltx.TXID, offset, size int64) (io.ReadCloser, error) {
 	if c.failReads {
 		return nil, errors.New("injected GET failure")
