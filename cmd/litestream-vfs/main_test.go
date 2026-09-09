@@ -198,6 +198,7 @@ func TestVFS_ActiveReadTransaction(t *testing.T) {
 	if err := db.Open(); err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { require.NoError(t, db.Close(context.Background())) })
 	sqldb0 := testingutil.MustOpenSQLDB(t, db.Path())
 	defer testingutil.MustCloseSQLDB(t, sqldb0)
 
@@ -276,6 +277,18 @@ func TestVFS_ActiveReadTransaction(t *testing.T) {
 		}
 		return strings.HasPrefix(data, "updated_data_5000")
 	}, 10*time.Second, db.MonitorInterval, "updates should replicate")
+
+	// Each connection polls separately. Wait for this connection's pending index.
+	pos, err := db.Pos()
+	require.NoError(t, err)
+	require.Eventually(t, func() bool {
+		var raw string
+		if err := tx.QueryRow("PRAGMA litestream_txid").Scan(&raw); err != nil {
+			return false
+		}
+		txid, err := ltx.ParseTXID(raw)
+		return err == nil && txid >= pos.TXID
+	}, 10*time.Second, db.MonitorInterval, "active connection should receive the pending index")
 
 	// The active read transaction should still see old data (snapshot isolation)
 	t.Log("verifying read transaction still sees old data")
