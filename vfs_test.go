@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -21,6 +22,63 @@ import (
 
 	"github.com/psanford/sqlite3vfs"
 )
+
+type blockedIndexClient struct {
+	ReplicaClient
+	started chan struct{}
+	release chan struct{}
+}
+
+func (c *blockedIndexClient) OpenLTXFile(ctx context.Context, level int, minTXID, maxTXID ltx.TXID, offset, size int64) (io.ReadCloser, error) {
+	select {
+	case c.started <- struct{}{}:
+	default:
+	}
+	select {
+	case <-c.release:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	return c.ReplicaClient.OpenLTXFile(ctx, level, minTXID, maxTXID, offset, size)
+}
+
+func TestVFSFile_BuildIndexBoundsJobs(t *testing.T) {
+	base := newMockReplicaClient()
+	fixture := buildLTXFixtureWithPage(t, 1, DefaultPageSize, 1, 'a')
+	base.addFixture(t, fixture)
+	client := &blockedIndexClient{
+		ReplicaClient: base,
+		started:       make(chan struct{}, 1),
+		release:       make(chan struct{}),
+	}
+	f := NewVFSFile(client, "bounded.db", slog.New(slog.NewTextHandler(io.Discard, nil)))
+	infos := make([]*ltx.FileInfo, 5000)
+	for i := range infos {
+		infos[i] = fixture.info
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	before := runtime.NumGoroutine()
+	done := make(chan error, 1)
+	go func() {
+		_, err := f.buildIndexMap(ctx, infos)
+		done <- err
+	}()
+	select {
+	case <-client.started:
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+	time.Sleep(100 * time.Millisecond)
+	added := runtime.NumGoroutine() - before
+	close(client.release)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if added > 100 {
+		t.Fatalf("5000 index files created %d goroutines", added)
+	}
+}
 
 func TestVFSFile_LockStateMachine(t *testing.T) {
 	f := &VFSFile{logger: slog.Default(), writeEnabled: true}

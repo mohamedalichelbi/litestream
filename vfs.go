@@ -1378,42 +1378,47 @@ func (f *VFSFile) buildIndexMap(ctx context.Context, infos []*ltx.FileInfo) (map
 		commit uint32
 	}
 
-	files := make([]indexFile, len(infos))
-	g, ctx := errgroup.WithContext(ctx)
-	for i, info := range infos {
-		i, info := i, info
-		g.Go(func() error {
-			if err := remoteReadSemaphore.Acquire(ctx, 1); err != nil {
-				return err
-			}
-			defer remoteReadSemaphore.Release(1)
-
-			f.logger.Debug("opening page index", "level", info.Level, "min", info.MinTXID, "max", info.MaxTXID)
-			idx, err := FetchPageIndex(ctx, f.client, info)
-			if err != nil {
-				return fmt.Errorf("fetch page index: %w", err)
-			}
-			hdr, err := FetchLTXHeader(ctx, f.client, info)
-			if err != nil {
-				return fmt.Errorf("fetch header: %w", err)
-			}
-			files[i] = indexFile{index: idx, commit: hdr.Commit}
-			return nil
-		})
-	}
-	if err := g.Wait(); err != nil {
-		return nil, err
-	}
-
 	index := make(map[uint32]ltx.PageIndexElem)
 	var commit uint32
-	for _, file := range files {
-		// Replace pages in overall index with new pages.
-		for k, v := range file.index {
-			f.logger.Debug("adding page index", "page", k, "elem", v)
-			index[k] = v
+	// Bound both active jobs and decoded indexes, not only remote requests.
+	for batch := range slices.Chunk(infos, defaultRemoteReadConcurrency) {
+		files := make([]indexFile, len(batch))
+		g, batchCtx := errgroup.WithContext(ctx)
+		for i, info := range batch {
+			g.Go(func() error {
+				if err := remoteReadSemaphore.Acquire(batchCtx, 1); err != nil {
+					return err
+				}
+				defer remoteReadSemaphore.Release(1)
+
+				idx, err := FetchPageIndex(batchCtx, f.client, info)
+				if err != nil {
+					return fmt.Errorf("fetch page index: %w", err)
+				}
+				hdr, err := FetchLTXHeader(batchCtx, f.client, info)
+				if err != nil {
+					return fmt.Errorf("fetch header: %w", err)
+				}
+				files[i] = indexFile{index: idx, commit: hdr.Commit}
+				return nil
+			})
 		}
-		commit = file.commit
+		if err := g.Wait(); err != nil {
+			return nil, err
+		}
+		for _, file := range files {
+			if file.commit < commit {
+				for pgno := range index {
+					if pgno > file.commit {
+						delete(index, pgno)
+					}
+				}
+			}
+			for pgno, elem := range file.index {
+				index[pgno] = elem
+			}
+			commit = file.commit
+		}
 	}
 
 	f.mu.Lock()

@@ -306,6 +306,25 @@ func TestVFSFile_WriteAt(t *testing.T) {
 	}
 }
 
+func TestVFSFile_BuildIndexAppliesTruncation(t *testing.T) {
+	client := newWriteTestReplicaClient()
+	page := make([]byte, DefaultPageSize)
+	createTestLTXFile(t, client, 1, DefaultPageSize, 2, map[uint32][]byte{1: page, 2: page})
+	lastTXID := ltx.TXID(defaultRemoteReadConcurrency + 2)
+	for txid := ltx.TXID(2); txid < lastTXID; txid++ {
+		createTestLTXFile(t, client, txid, DefaultPageSize, 2, map[uint32][]byte{1: page})
+	}
+	createTestLTXFile(t, client, lastTXID, DefaultPageSize, 1, map[uint32][]byte{1: page})
+	f := NewVFSFile(client, "truncate.db", slog.Default())
+	index, err := f.buildIndexMap(context.Background(), client.ltxFiles[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(index) != 1 || index[1].MaxTXID != lastTXID || f.commit != 1 {
+		t.Fatalf("incorrect truncated index: commit=%d, index=%v", f.commit, index)
+	}
+}
+
 func TestVFSFile_SyncToRemote(t *testing.T) {
 	client := newWriteTestReplicaClient()
 
