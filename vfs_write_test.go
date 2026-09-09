@@ -481,6 +481,97 @@ func (c *heldPollClient) LTXFiles(ctx context.Context, level int, seek ltx.TXID,
 	return itr, err
 }
 
+func TestVFSFile_PollShrinkPreservesUnchangedPage(t *testing.T) {
+	for _, mode := range []struct{ reader, grow bool }{{}, {reader: true}, {grow: true}, {reader: true, grow: true}} {
+		t.Run(fmt.Sprintf("reader=%t/grow=%t", mode.reader, mode.grow), func(t *testing.T) {
+			client := newWriteTestReplicaClient()
+			page := bytes.Repeat([]byte{'a'}, DefaultPageSize)
+			createTestLTXFile(t, client, 1, DefaultPageSize, 3, map[uint32][]byte{1: page, 2: page, 3: page})
+			f := NewVFSFile(client, "shrink.db", slog.Default())
+			f.PollInterval = time.Hour
+			if err := f.Open(); err != nil {
+				t.Fatal(err)
+			}
+			defer f.Close()
+			if mode.reader {
+				if err := f.Lock(sqlite3vfs.LockShared); err != nil {
+					t.Fatal(err)
+				}
+			}
+			createTestLTXFile(t, client, 2, DefaultPageSize, 2, map[uint32][]byte{1: page})
+			newPage := bytes.Repeat([]byte{'b'}, DefaultPageSize)
+			if mode.grow {
+				createTestLTXFile(t, client, 3, DefaultPageSize, 3, map[uint32][]byte{1: page, 3: newPage})
+			}
+			if err := f.pollReplicaClient(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			actual := make([]byte, DefaultPageSize)
+			if mode.reader {
+				if _, err := f.ReadAt(actual, 2*DefaultPageSize); err != nil || !bytes.Equal(actual, page) {
+					t.Fatalf("active reader lost its old page: %v", err)
+				}
+				if err := f.Unlock(sqlite3vfs.LockNone); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if _, err := f.ReadAt(actual, DefaultPageSize); err != nil {
+				t.Fatalf("unchanged page was removed by truncation: %v", err)
+			}
+			if !bytes.Equal(actual, page) {
+				t.Fatal("truncation changed a retained page")
+			}
+			_, err := f.ReadAt(actual, 2*DefaultPageSize)
+			if mode.grow {
+				if err != nil || !bytes.Equal(actual, newPage) {
+					t.Fatalf("regrowth did not replace the truncated page: %v", err)
+				}
+			} else if err == nil {
+				t.Fatal("truncated page is still readable")
+			}
+		})
+	}
+}
+
+func TestVFSFile_RepeatedPendingTruncation(t *testing.T) {
+	client := newWriteTestReplicaClient()
+	oldPage := bytes.Repeat([]byte{'a'}, DefaultPageSize)
+	newPage := bytes.Repeat([]byte{'b'}, DefaultPageSize)
+	createTestLTXFile(t, client, 1, DefaultPageSize, 3, map[uint32][]byte{1: oldPage, 2: oldPage, 3: oldPage})
+	f := NewVFSFile(client, "pending-shrink.db", slog.Default())
+	f.PollInterval = time.Hour
+	if err := f.Open(); err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	if err := f.Lock(sqlite3vfs.LockShared); err != nil {
+		t.Fatal(err)
+	}
+	for txid, commit := range []uint32{2, 1, 2} {
+		pages := map[uint32][]byte{1: newPage}
+		if txid == 2 {
+			pages[2] = newPage
+		}
+		createTestLTXFile(t, client, ltx.TXID(txid+2), DefaultPageSize, commit, pages)
+		if err := f.pollReplicaClient(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	page := make([]byte, DefaultPageSize)
+	if _, err := f.ReadAt(page, DefaultPageSize); err != nil || !bytes.Equal(page, oldPage) {
+		t.Fatalf("reader lost its old snapshot: %v", err)
+	}
+	if err := f.Unlock(sqlite3vfs.LockNone); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.ReadAt(page, DefaultPageSize); err != nil || !bytes.Equal(page, newPage) {
+		t.Fatalf("pending regrowth lost the new page: %v", err)
+	}
+	if _, err := f.ReadAt(page, 2*DefaultPageSize); err == nil {
+		t.Fatal("pending truncation retained a deleted page")
+	}
+}
+
 func TestVFSFile_PollCannotUndoLocalSync(t *testing.T) {
 	base := newWriteTestReplicaClient()
 	pages := make(map[uint32][]byte)

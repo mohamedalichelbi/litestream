@@ -2772,48 +2772,28 @@ func (f *VFSFile) pollReplicaClient(ctx context.Context) error {
 	f.mu.Unlock()
 
 	f.logger.Debug("polling replica client", "txid", pos.TXID.String())
-	combined := make(map[uint32]ltx.PageIndexElem)
-	baseCommit := startCommit
-	newCommit := baseCommit
-	replaceIndex := false
-
-	maxTXID0, idx0, commit0, replace0, err := f.pollLevel(ctx, 0, pos.TXID, baseCommit)
-	if err != nil {
-		return fmt.Errorf("poll L0: %w", err)
-	}
-	if replace0 {
-		replaceIndex = true
-		baseCommit = commit0
-		newCommit = commit0
-		combined = idx0
-	} else {
-		if len(idx0) > 0 {
-			baseCommit = commit0
-		}
-		for k, v := range idx0 {
-			combined[k] = v
-		}
-		if commit0 > newCommit {
-			newCommit = commit0
-		}
-	}
-
-	maxTXID1, idx1, commit1, replace1, err := f.pollLevel(ctx, 1, maxTXID1Snapshot, baseCommit)
+	// Read compacted history before the newer level-zero transactions.
+	maxTXID1, combined, baseCommit, truncateAt, err := f.pollLevel(ctx, 1, maxTXID1Snapshot, pos.TXID, startCommit)
 	if err != nil {
 		return fmt.Errorf("poll L1: %w", err)
 	}
-	if replace1 {
-		replaceIndex = true
-		baseCommit = commit1
-		newCommit = commit1
-		combined = idx1
-	} else {
-		for k, v := range idx1 {
-			combined[k] = v
+	baseTXID := max(pos.TXID, maxTXID1)
+	maxTXID0, idx0, newCommit, truncate0, err := f.pollLevel(ctx, 0, baseTXID, baseTXID, baseCommit)
+	if err != nil {
+		return fmt.Errorf("poll L0: %w", err)
+	}
+	if truncate0 != nil {
+		for pgno := range combined {
+			if pgno > *truncate0 {
+				delete(combined, pgno)
+			}
 		}
-		if commit1 > newCommit {
-			newCommit = commit1
+		if truncateAt == nil || *truncate0 < *truncateAt {
+			truncateAt = truncate0
 		}
+	}
+	for pgno, elem := range idx0 {
+		combined[pgno] = elem
 	}
 
 	// Send updates to a pending list if there are active readers.
@@ -2842,20 +2822,38 @@ func (f *VFSFile) pollReplicaClient(ctx context.Context) error {
 	} else {
 		f.pendingReplace = false
 	}
-	if replaceIndex {
-		if f.lockType < sqlite3vfs.LockShared {
-			f.index = make(map[uint32]ltx.PageIndexElem)
-			target = f.index
-			targetIsMain = true
-			f.pendingReplace = false
-		} else {
-			f.pending = make(map[uint32]ltx.PageIndexElem)
-			target = f.pending
-			targetIsMain = false
+	if truncateAt != nil {
+		if !targetIsMain && !f.pendingReplace {
+			// Copy only when a reader needs the old index after truncation.
+			for pgno, elem := range f.index {
+				if _, ok := target[pgno]; !ok {
+					target[pgno] = elem
+				}
+			}
 			f.pendingReplace = true
+		}
+		for pgno := range target {
+			if pgno > *truncateAt {
+				delete(target, pgno)
+				if targetIsMain {
+					f.cache.Remove(pgno)
+				}
+			}
 		}
 	}
 	for k, v := range combined {
+		if k > newCommit {
+			continue
+		}
+		// Compaction can arrive after a newer page from level zero.
+		if current, ok := target[k]; ok && current.MaxTXID > v.MaxTXID {
+			continue
+		}
+		if !targetIsMain && !f.pendingReplace {
+			if current, ok := f.index[k]; ok && current.MaxTXID > v.MaxTXID {
+				continue
+			}
+		}
 		target[k] = v
 		// Invalidate cache if we're updating the main index
 		if targetIsMain {
@@ -2868,11 +2866,7 @@ func (f *VFSFile) pollReplicaClient(ctx context.Context) error {
 		f.logger.Debug("cache invalidated pages due to new ltx files", "count", invalidateN)
 	}
 
-	if replaceIndex {
-		f.commit = newCommit
-	} else if len(combined) > 0 && newCommit > f.commit {
-		f.commit = newCommit
-	}
+	f.commit = newCommit
 
 	if maxTXID0 > maxTXID1 {
 		f.pos.TXID = maxTXID0
@@ -2894,11 +2888,11 @@ func (f *VFSFile) pollReplicaClient(ctx context.Context) error {
 }
 
 // pollLevel fetches LTX files for a specific level and returns the highest TXID seen,
-// any index updates, the latest commit value, and if the index should be replaced.
-func (f *VFSFile) pollLevel(ctx context.Context, level int, prevMaxTXID ltx.TXID, baseCommit uint32) (ltx.TXID, map[uint32]ltx.PageIndexElem, uint32, bool, error) {
+// index updates, the latest page count, and the lowest truncation boundary.
+func (f *VFSFile) pollLevel(ctx context.Context, level int, prevMaxTXID, baseTXID ltx.TXID, baseCommit uint32) (ltx.TXID, map[uint32]ltx.PageIndexElem, uint32, *uint32, error) {
 	itr, err := f.client.LTXFiles(ctx, level, prevMaxTXID+1, false)
 	if err != nil {
-		return prevMaxTXID, nil, baseCommit, false, fmt.Errorf("ltx files: %w", err)
+		return prevMaxTXID, nil, baseCommit, nil, fmt.Errorf("ltx files: %w", err)
 	}
 	defer func() { _ = itr.Close() }()
 
@@ -2906,7 +2900,7 @@ func (f *VFSFile) pollLevel(ctx context.Context, level int, prevMaxTXID ltx.TXID
 	maxTXID := prevMaxTXID
 	lastCommit := baseCommit
 	newCommit := baseCommit
-	replaceIndex := false
+	var truncateAt *uint32
 
 	for itr.Next() {
 		info := itr.Item()
@@ -2919,26 +2913,36 @@ func (f *VFSFile) pollLevel(ctx context.Context, level int, prevMaxTXID ltx.TXID
 				f.logger.Warn("ltx gap detected at L0, deferring to higher levels", "expected", maxTXID+1, "next", info.MinTXID)
 				break
 			}
-			return maxTXID, nil, newCommit, replaceIndex, fmt.Errorf("non-contiguous ltx file: level=%d, current=%s, next=%s-%s", level, maxTXID, info.MinTXID, info.MaxTXID)
+			return maxTXID, nil, newCommit, truncateAt, fmt.Errorf("non-contiguous ltx file: level=%d, current=%s, next=%s-%s", level, maxTXID, info.MinTXID, info.MaxTXID)
 		}
 
 		f.logger.Debug("new ltx file", "level", info.Level, "min", info.MinTXID, "max", info.MaxTXID)
 
 		idx, err := FetchPageIndex(ctx, f.client, info)
 		if err != nil {
-			return maxTXID, nil, newCommit, replaceIndex, fmt.Errorf("fetch page index: %w", err)
+			return maxTXID, nil, newCommit, truncateAt, fmt.Errorf("fetch page index: %w", err)
 		}
 		hdr, err := FetchLTXHeader(ctx, f.client, info)
 		if err != nil {
-			return maxTXID, nil, newCommit, replaceIndex, fmt.Errorf("fetch header: %w", err)
+			return maxTXID, nil, newCommit, truncateAt, fmt.Errorf("fetch header: %w", err)
 		}
 
-		if hdr.Commit < lastCommit {
-			replaceIndex = true
-			index = make(map[uint32]ltx.PageIndexElem)
+		// Old compaction objects must not change the current database size.
+		if info.MaxTXID > baseTXID {
+			if hdr.Commit < lastCommit {
+				if truncateAt == nil || hdr.Commit < *truncateAt {
+					boundary := hdr.Commit
+					truncateAt = &boundary
+				}
+				for pgno := range index {
+					if pgno > hdr.Commit {
+						delete(index, pgno)
+					}
+				}
+			}
+			lastCommit = hdr.Commit
+			newCommit = hdr.Commit
 		}
-		lastCommit = hdr.Commit
-		newCommit = hdr.Commit
 
 		for k, v := range idx {
 			f.logger.Debug("adding new page index", "page", k, "elem", v)
@@ -2947,7 +2951,10 @@ func (f *VFSFile) pollLevel(ctx context.Context, level int, prevMaxTXID ltx.TXID
 		maxTXID = info.MaxTXID
 	}
 
-	return maxTXID, index, newCommit, replaceIndex, nil
+	if err := itr.Err(); err != nil {
+		return maxTXID, nil, newCommit, truncateAt, fmt.Errorf("iterate ltx files: %w", err)
+	}
+	return maxTXID, index, newCommit, truncateAt, nil
 }
 
 func (f *VFSFile) pageSizeBytes() (uint32, error) {

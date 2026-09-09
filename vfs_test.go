@@ -122,6 +122,84 @@ func TestVFSFile_LockStateMachine(t *testing.T) {
 	}
 }
 
+type failedPollIterator struct{ ltx.FileIterator }
+
+func (i failedPollIterator) Err() error { return io.ErrUnexpectedEOF }
+
+type failedPollClient struct{ ReplicaClient }
+
+func (c failedPollClient) LTXFiles(ctx context.Context, level int, seek ltx.TXID, metadata bool) (ltx.FileIterator, error) {
+	itr, err := c.ReplicaClient.LTXFiles(ctx, level, seek, metadata)
+	if err != nil {
+		return nil, err
+	}
+	return failedPollIterator{itr}, nil
+}
+
+func TestVFSFile_PollIteratorFailure(t *testing.T) {
+	client := newMockReplicaClient()
+	client.addFixture(t, buildLTXFixture(t, 1, 'a'))
+	f := NewVFSFile(failedPollClient{client}, "failed-list.db", slog.Default())
+	_, _, _, _, err := f.pollLevel(context.Background(), 0, 0, 0, 0)
+	if !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Fatalf("incomplete listing accepted: %v", err)
+	}
+}
+
+func TestVFSFile_PollCompactionPreservesNewerPage(t *testing.T) {
+	for _, mode := range []struct{ delayed, reader bool }{{}, {delayed: true}, {reader: true}, {delayed: true, reader: true}} {
+		t.Run(fmt.Sprintf("delayed=%t/reader=%t", mode.delayed, mode.reader), func(t *testing.T) {
+			client := newMockReplicaClient()
+			client.addFixture(t, buildLTXFixture(t, 1, 'a'))
+			initial := buildLTXFixture(t, 1, 'a')
+			initial.info.Level = 1
+			client.addFixture(t, initial)
+			f := NewVFSFile(client, "compacted.db", slog.Default())
+			f.PollInterval = time.Hour
+			if err := f.Open(); err != nil {
+				t.Fatal(err)
+			}
+			defer f.Close()
+			client.addFixture(t, buildLTXFixture(t, 2, 'a'))
+			client.addFixture(t, buildLTXFixtureWithPages(t, 3, DefaultPageSize, []uint32{1, 2}, 'b'))
+			if mode.delayed {
+				if err := f.pollReplicaClient(context.Background()); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if mode.reader {
+				if err := f.Lock(sqlite3vfs.LockShared); err != nil {
+					t.Fatal(err)
+				}
+			}
+			compacted := buildLTXFixture(t, 2, 'a')
+			compacted.info.Level = 1
+			client.addFixture(t, compacted)
+			if err := f.pollReplicaClient(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			if mode.reader {
+				if err := f.Unlock(sqlite3vfs.LockNone); err != nil {
+					t.Fatal(err)
+				}
+			}
+			page := make([]byte, DefaultPageSize)
+			if _, err := f.ReadAt(page, 0); err != nil {
+				t.Fatal(err)
+			}
+			if page[100] != 'b' {
+				t.Fatalf("compaction replaced transaction 3 page with %q", page[100])
+			}
+			if size, err := f.FileSize(); err != nil || size != 2*DefaultPageSize {
+				t.Fatalf("old compaction changed the current size: size=%d err=%v", size, err)
+			}
+			if _, err := f.ReadAt(page, DefaultPageSize); err != nil || page[100] != 'b' {
+				t.Fatalf("old compaction removed the newer page: %v", err)
+			}
+		})
+	}
+}
+
 func TestVFSFile_PendingIndexIsolation(t *testing.T) {
 	client := newMockReplicaClient()
 	client.addFixture(t, buildLTXFixture(t, 1, 'a'))
