@@ -2117,3 +2117,61 @@ func TestVFS_CloseReleasesWriteSlot(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+type closeTestReplicaClient struct {
+	*syncFailureReplicaClient
+	closeErr error
+	closed   bool
+}
+
+func (c *closeTestReplicaClient) Close() error {
+	c.closed = true
+	return c.closeErr
+}
+
+func TestVFSFile_CloseErrors(t *testing.T) {
+	for _, failUpload := range []bool{false, true} {
+		for _, failClose := range []bool{false, true} {
+			t.Run(fmt.Sprintf("upload=%v/client=%v", failUpload, failClose), func(t *testing.T) {
+				base := newWriteTestReplicaClient()
+				createTestLTXFile(t, base, 1, DefaultPageSize, 1,
+					map[uint32][]byte{1: make([]byte, DefaultPageSize)})
+				client := &closeTestReplicaClient{syncFailureReplicaClient: &syncFailureReplicaClient{
+					writeTestReplicaClient: base, failUpload: failUpload,
+				}}
+				if failClose {
+					client.closeErr = errors.New("injected client close failure")
+				}
+				v := NewVFS(client, slog.Default())
+				v.WriteEnabled = true
+				v.WriteSyncInterval = 0
+				file, _, err := v.openMainDB("test.db", nil, sqlite3vfs.OpenMainDB|sqlite3vfs.OpenReadWrite)
+				if err != nil {
+					t.Fatal(err)
+				}
+				f := file.(*VFSFile)
+				f.perConnClient = true
+				if _, err := f.WriteAt([]byte("pending"), 0); err != nil {
+					_ = f.Close()
+					t.Fatal(err)
+				}
+				err = f.Close()
+				if failUpload && (err == nil || !strings.Contains(err.Error(), "injected PUT failure")) {
+					t.Fatalf("missing upload error: %v", err)
+				}
+				if failClose && !errors.Is(err, client.closeErr) {
+					t.Fatalf("missing client close error: %v", err)
+				}
+				if !failUpload && !failClose && err != nil {
+					t.Fatal(err)
+				}
+				if !client.closed || len(v.writeStates) != 0 {
+					t.Fatal("close did not release the client and writer state")
+				}
+				if _, err := os.Stat(f.bufferPath); !errors.Is(err, os.ErrNotExist) {
+					t.Fatalf("write buffer remains after close: %v", err)
+				}
+			})
+		}
+	}
+}

@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -29,6 +30,64 @@ import (
 // =============================================================================
 // Basic Operations Tests
 // =============================================================================
+
+type closeErrorVFS struct {
+	*litestream.VFS
+	result chan error
+}
+
+func (v *closeErrorVFS) OpenURI(name string, params map[string]string, flags sqlite3vfs.OpenFlag) (sqlite3vfs.File, sqlite3vfs.OpenFlag, error) {
+	f, outFlags, err := v.VFS.OpenURI(name, params, flags)
+	if main, ok := f.(*litestream.VFSFile); ok {
+		f = &closeErrorFile{VFSFile: main, result: v.result}
+	}
+	return f, outFlags, err
+}
+
+type closeErrorFile struct {
+	*litestream.VFSFile
+	result chan error
+}
+
+func (f *closeErrorFile) Close() error {
+	err := f.VFSFile.Close()
+	f.result <- err
+	return err
+}
+
+type rejectedCloseUploadClient struct {
+	litestream.ReplicaClient
+	err error
+}
+
+func (c *rejectedCloseUploadClient) WriteLTXFile(context.Context, int, ltx.TXID, ltx.TXID, io.Reader) (*ltx.FileInfo, error) {
+	return nil, c.err
+}
+
+func TestVFS_SQLiteCloseDoesNotConfirmPersistence(t *testing.T) {
+	client := file.NewReplicaClient(t.TempDir())
+	setupInitialDB(t, client)
+	uploadErr := errors.New("injected close upload failure")
+	vfs := &closeErrorVFS{
+		VFS:    newWritableVFS(t, &rejectedCloseUploadClient{ReplicaClient: client, err: uploadErr}, time.Hour, t.TempDir()),
+		result: make(chan error, 1),
+	}
+	vfsName := fmt.Sprintf("litestream-close-error-%d", time.Now().UnixNano())
+	require.NoError(t, sqlite3vfs.RegisterVFS(vfsName, vfs))
+	db, err := sql.Open("sqlite3", fmt.Sprintf("file:test.db?vfs=%s", vfsName))
+	require.NoError(t, err)
+	defer db.Close()
+	_, err = db.Exec("CREATE TABLE pending (value TEXT)")
+	require.NoError(t, err)
+	// SQLite closes the connection but does not report the VFS upload error.
+	require.NoError(t, db.Close())
+	select {
+	case err := <-vfs.result:
+		require.ErrorIs(t, err, uploadErr)
+	case <-time.After(time.Second):
+		t.Fatal("SQLite did not close the VFS file")
+	}
+}
 
 // TestVFS_WriteAndSync_FileBackend tests basic write and sync functionality
 // with the file backend.

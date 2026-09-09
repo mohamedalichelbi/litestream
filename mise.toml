@@ -35,6 +35,13 @@ go test -race -tags='vfs,SQLITE3VFS_LOADABLE_EXT' -run '^TestVFSFile_DurabilityS
 go test -race -tags=vfs -run '^TestVFS_DurabilityStatusDuringUpload$' -count=1 -timeout=30s ./cmd/litestream-vfs
 '''
 
+[tasks.vfs-close-test]
+description = "Check close errors and SQLite's close-time persistence limit."
+run = '''
+go test -race -tags='vfs,SQLITE3VFS_LOADABLE_EXT' -run '^TestVFSFile_CloseErrors$' -count=1 -timeout=30s .
+go test -race -tags=vfs -run '^TestVFS_SQLiteCloseDoesNotConfirmPersistence$' -count=1 -timeout=30s ./cmd/litestream-vfs
+'''
+
 [tasks.vfs-build-linux-amd64]
 description = "Build the Linux AMD64 writable VFS extension."
 run = '''

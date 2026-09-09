@@ -1517,7 +1517,9 @@ func (f *VFSFile) applySyncedPagesToHydratedFile() error {
 	return nil
 }
 
-func (f *VFSFile) Close() error {
+// Close releases local state even if the final upload fails. Callers must confirm
+// persistence before close. SQLite does not report VFS close errors to its caller.
+func (f *VFSFile) Close() (closeErr error) {
 	f.logger.Debug("closing file")
 
 	// Stop sync loop and ticker if running (need mutex for syncStop)
@@ -1541,7 +1543,7 @@ func (f *VFSFile) Close() error {
 	f.mu.Lock()
 	if f.writeEnabled && len(f.dirty) > 0 {
 		if err := f.syncToRemoteWithLock(); err != nil {
-			f.logger.Error("failed to sync on close", "error", err)
+			closeErr = fmt.Errorf("sync on close: %w", err)
 		}
 	}
 	f.mu.Unlock()
@@ -1551,14 +1553,18 @@ func (f *VFSFile) Close() error {
 
 	// Close and remove buffer file if open
 	if f.bufferFile != nil {
-		f.bufferFile.Close()
-		os.Remove(f.bufferPath)
+		if err := f.bufferFile.Close(); err != nil {
+			closeErr = errors.Join(closeErr, fmt.Errorf("close write buffer: %w", err))
+		}
+		if err := os.Remove(f.bufferPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+			closeErr = errors.Join(closeErr, fmt.Errorf("remove write buffer: %w", err))
+		}
 	}
 
 	// Close and remove hydration file
 	if f.hydrator != nil {
 		if err := f.hydrator.Close(); err != nil {
-			f.logger.Warn("failed to close hydration file", "error", err)
+			closeErr = errors.Join(closeErr, fmt.Errorf("close hydration file: %w", err))
 		}
 	}
 
@@ -1577,12 +1583,16 @@ func (f *VFSFile) Close() error {
 	if f.perConnClient {
 		if closer, ok := f.client.(io.Closer); ok {
 			if err := closer.Close(); err != nil {
-				f.logger.Warn("failed to close per-connection client", "error", err)
+				closeErr = errors.Join(closeErr, fmt.Errorf("close per-connection client: %w", err))
 			}
 		}
 	}
 
-	return nil
+	// SQLite discards this return value. Keep the failure visible in its logs.
+	if closeErr != nil {
+		f.logger.Error("failed to close file", "error", closeErr)
+	}
+	return closeErr
 }
 
 func (f *VFSFile) ReadAt(p []byte, off int64) (n int, err error) {
