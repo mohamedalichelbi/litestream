@@ -457,6 +457,7 @@ type syncFailureReplicaClient struct {
 	*writeTestReplicaClient
 	failReads  bool
 	failUpload bool
+	readCalls  atomic.Int64
 }
 
 type heldPollClient struct {
@@ -555,10 +556,113 @@ func TestVFSFile_PollPreservesUnsynchronizedPages(t *testing.T) {
 }
 
 func (c *syncFailureReplicaClient) OpenLTXFile(ctx context.Context, level int, minTXID, maxTXID ltx.TXID, offset, size int64) (io.ReadCloser, error) {
+	c.readCalls.Add(1)
 	if c.failReads {
 		return nil, errors.New("injected GET failure")
 	}
 	return c.writeTestReplicaClient.OpenLTXFile(ctx, level, minTXID, maxTXID, offset, size)
+}
+
+func TestVFSFile_ShortHeaderRead(t *testing.T) {
+	base := newWriteTestReplicaClient()
+	page := bytes.Repeat([]byte{'a'}, DefaultPageSize)
+	createTestLTXFile(t, base, 1, DefaultPageSize, 1, map[uint32][]byte{1: page})
+	v := NewVFS(base, slog.Default())
+	v.PollInterval = time.Hour
+	f := openWriteVFSFile(t, v)
+	for _, length := range []int{0, 1, 27, 28, 100} {
+		f.cache.Purge()
+		for range 2 {
+			buf := make([]byte, length)
+			if n, err := f.ReadAt(buf, 0); err != nil || n != length {
+				t.Fatalf("header read of %d bytes: n=%d err=%v", length, n, err)
+			}
+			if length > 0 && buf[0] != 'a' {
+				t.Fatal("header prefix changed")
+			}
+		}
+	}
+}
+
+func TestVFSFile_FailedBufferWriteDoesNotGrow(t *testing.T) {
+	base := newWriteTestReplicaClient()
+	page := bytes.Repeat([]byte{'a'}, DefaultPageSize)
+	createTestLTXFile(t, base, 1, DefaultPageSize, 1, map[uint32][]byte{1: page})
+	v := NewVFS(base, slog.Default())
+	v.WriteEnabled = true
+	v.PollInterval = time.Hour
+	v.WriteSyncInterval = time.Hour
+	f := openWriteVFSFile(t, v)
+	if err := f.bufferFile.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := f.WriteAt(page, DefaultPageSize); err == nil || n != 0 {
+		t.Fatalf("closed buffer write: n=%d err=%v", n, err)
+	}
+	if f.commit != 1 || f.bufferNextOff != 0 || len(f.dirty) != 0 {
+		t.Error("failed write advanced database or buffer state")
+	}
+	var err error
+	f.bufferFile, err = os.OpenFile(f.bufferPath, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestVFSFile_PageReadFailure(t *testing.T) {
+	for _, missingIndex := range []bool{false, true} {
+		t.Run(fmt.Sprintf("missing-index=%v", missingIndex), func(t *testing.T) {
+			base := newWriteTestReplicaClient()
+			page := bytes.Repeat([]byte{'a'}, DefaultPageSize)
+			createTestLTXFile(t, base, 1, DefaultPageSize, 2, map[uint32][]byte{1: page, 2: page})
+			client := &syncFailureReplicaClient{writeTestReplicaClient: base}
+			v := NewVFS(client, slog.Default())
+			v.WriteEnabled = true
+			v.PollInterval = time.Hour
+			v.WriteSyncInterval = time.Hour
+			f := openWriteVFSFile(t, v)
+			if missingIndex {
+				delete(f.index, 2)
+			} else {
+				client.failReads = true
+			}
+			if n, err := f.ReadAt(make([]byte, DefaultPageSize), DefaultPageSize); err == nil || n != 0 {
+				t.Errorf("missing data read: n=%d err=%v", n, err)
+			}
+			if n, err := f.WriteAt([]byte("patch"), DefaultPageSize+100); err == nil || n != 0 {
+				t.Errorf("partial write ignored missing data: n=%d err=%v", n, err)
+			}
+			if len(f.dirty) != 0 || f.commit != 2 {
+				t.Fatal("failed write changed local state")
+			}
+			// A full-page replacement does not need the old page contents.
+			client.readCalls.Store(0)
+			replacement := bytes.Repeat([]byte{'b'}, DefaultPageSize)
+			if n, err := f.WriteAt(replacement, DefaultPageSize); err != nil || n != len(replacement) {
+				t.Fatalf("full-page write: n=%d err=%v", n, err)
+			}
+			if calls := client.readCalls.Load(); calls != 0 {
+				t.Fatalf("full-page write made %d remote reads", calls)
+			}
+			got := make([]byte, DefaultPageSize)
+			if _, err := f.ReadAt(got, DefaultPageSize); err != nil || !bytes.Equal(got, replacement) {
+				t.Fatalf("replacement read: %v", err)
+			}
+			// A partial write to a new page starts with zeros.
+			if _, err := f.WriteAt([]byte("new"), 2*DefaultPageSize+100); err != nil {
+				t.Fatal(err)
+			}
+			clear(got)
+			if _, err := f.ReadAt(got, 2*DefaultPageSize); err != nil {
+				t.Fatal(err)
+			}
+			want := make([]byte, DefaultPageSize)
+			copy(want[100:], "new")
+			if !bytes.Equal(got, want) {
+				t.Fatal("new page contains stale data")
+			}
+		})
+	}
 }
 
 func (c *syncFailureReplicaClient) WriteLTXFile(ctx context.Context, level int, minTXID, maxTXID ltx.TXID, r io.Reader) (*ltx.FileInfo, error) {

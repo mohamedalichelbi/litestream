@@ -1641,7 +1641,7 @@ func (f *VFSFile) ReadAt(p []byte, off int64) (n int, err error) {
 		f.logger.Debug("cache hit", "page", pgno, "n", n)
 
 		// Update the first page to pretend like we are in journal mode.
-		if off == 0 {
+		if off == 0 && len(p) >= 28 {
 			p[18], p[19] = 0x01, 0x01
 			_, _ = rand.Read(p[24:28])
 		}
@@ -1652,13 +1652,12 @@ func (f *VFSFile) ReadAt(p []byte, off int64) (n int, err error) {
 	// Get page index element
 	f.mu.Lock()
 	elem, ok := f.index[pgno]
-	writeEnabled := f.writeEnabled // capture while holding lock to avoid data race
+	newPage := f.writeEnabled && pgno > f.commit
 	f.mu.Unlock()
 
 	if !ok {
-		// For write-enabled VFS with a new database (no existing pages),
-		// return zeros to indicate empty page. SQLite will initialize the database.
-		if writeEnabled {
+		// Only pages beyond the current size can start with zeros.
+		if newPage {
 			f.logger.Debug("page not found, returning zeros for new database", "page", pgno)
 			for i := range p {
 				p[i] = 0
@@ -1707,7 +1706,7 @@ func (f *VFSFile) ReadAt(p []byte, off int64) (n int, err error) {
 	f.logger.Debug("data read from storage", "page", pgno, "n", n, "data", len(data))
 
 	// Update the first page to pretend like we are in journal mode.
-	if off == 0 {
+	if off == 0 && len(p) >= 28 {
 		p[18], p[19] = 0x01, 0x01
 		_, _ = rand.Read(p[24:28])
 	}
@@ -1740,33 +1739,30 @@ func (f *VFSFile) WriteAt(b []byte, off int64) (n int, err error) {
 		return 0, sqlite3vfs.ReadOnlyError
 	}
 
-	// Get page data - either from buffer file (if dirty) or from cache/remote
+	// Partial writes must preserve the rest of an existing page.
 	page := make([]byte, pageSize)
-	if bufferOff, ok := f.dirty[pgno]; ok {
-		// Page is already dirty - read from buffer file
-		if _, err := f.bufferFile.ReadAt(page, bufferOff); err != nil {
-			return 0, fmt.Errorf("read dirty page from buffer: %w", err)
-		}
-	} else {
-		// Page is not dirty - read from cache/remote
-		if err := f.readPageForWrite(pgno, page); err != nil {
-			// If page doesn't exist, use zero-filled page
-			f.logger.Debug("page not found, using empty page", "pgno", pgno)
+	if pageOffset != 0 || len(b) < int(pageSize) {
+		if bufferOff, ok := f.dirty[pgno]; ok {
+			if _, err := f.bufferFile.ReadAt(page, bufferOff); err != nil {
+				return 0, fmt.Errorf("read dirty page from buffer: %w", err)
+			}
+		} else if pgno <= f.commit {
+			if err := f.readPageForWrite(pgno, page); err != nil {
+				return 0, fmt.Errorf("read page for partial write: %w", err)
+			}
 		}
 	}
 
 	// Apply write to page
 	n = copy(page[pageOffset:], b)
 
-	// Update commit count if this extends the database
-	if pgno > f.commit {
-		f.commit = pgno
-	}
-
 	// Write to buffer for durability (this updates f.dirty with the offset)
 	if err := f.writeToBuffer(pgno, page); err != nil {
 		f.logger.Error("failed to write to buffer", "error", err)
 		return 0, fmt.Errorf("write to buffer: %w", err)
+	}
+	if pgno > f.commit {
+		f.commit = pgno
 	}
 
 	f.logger.Debug("wrote to dirty page", "pgno", pgno, "offset", pageOffset, "len", n, "commit", f.commit)
@@ -2351,12 +2347,14 @@ func (f *VFSFile) writeToBuffer(pgno uint32, data []byte) error {
 	} else {
 		// New page - append to end of file
 		writeOffset = f.bufferNextOff
-		f.bufferNextOff += int64(len(data))
 	}
 
 	// Write page data (no header, just raw page data)
 	if _, err := f.bufferFile.WriteAt(data, writeOffset); err != nil {
 		return fmt.Errorf("write page to buffer: %w", err)
+	}
+	if writeOffset == f.bufferNextOff {
+		f.bufferNextOff += int64(len(data))
 	}
 
 	// Update dirty map with offset

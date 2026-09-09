@@ -42,6 +42,10 @@ go test -race -tags='vfs,SQLITE3VFS_LOADABLE_EXT' -run '^TestVFSFile_CloseErrors
 go test -race -tags=vfs -run '^TestVFS_SQLiteCloseDoesNotConfirmPersistence$' -count=1 -timeout=30s ./cmd/litestream-vfs
 '''
 
+[tasks.vfs-page-io-test]
+description = "Check missing pages, partial writes, short reads, and buffer errors."
+run = "go test -race -tags='vfs,SQLITE3VFS_LOADABLE_EXT' -run '^TestVFSFile_(PageReadFailure|ShortHeaderRead|FailedBufferWriteDoesNotGrow)$' -count=10 -timeout=30s ."
+
 [tasks.vfs-poll-order-test]
 description = "Check poll ordering against dirty writes, sync, and truncation."
 run = '''
