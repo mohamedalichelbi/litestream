@@ -42,6 +42,10 @@ go test -race -tags='vfs,SQLITE3VFS_LOADABLE_EXT' -run '^TestVFSFile_CloseErrors
 go test -race -tags=vfs -run '^TestVFS_SQLiteCloseDoesNotConfirmPersistence$' -count=1 -timeout=30s ./cmd/litestream-vfs
 '''
 
+[tasks.vfs-short-write-test]
+description = "Reject sync and close after a real partial buffer write on Linux."
+run = "go test -race -tags='vfs,SQLITE3VFS_LOADABLE_EXT' -run '^TestVFSFile_PartialBufferWriteFailure$' -count=5 -timeout=1m ."
+
 [tasks.vfs-page-io-test]
 description = "Check missing pages, partial writes, short reads, and buffer errors."
 run = "go test -race -tags='vfs,SQLITE3VFS_LOADABLE_EXT' -run '^TestVFSFile_(PageReadFailure|ShortHeaderRead|FailedBufferWriteDoesNotGrow)$' -count=10 -timeout=30s ."

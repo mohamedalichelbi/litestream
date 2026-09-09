@@ -661,6 +661,7 @@ type VFSFile struct {
 	bufferFile    *os.File         // Temp file for durability
 	bufferPath    string           // Path to buffer file
 	bufferNextOff int64            // Next write offset in buffer file
+	bufferErr     error            // A failed write can leave mixed bytes. Reopen to recover.
 	syncTicker    *time.Ticker     // Ticker for periodic sync
 	syncInterval  time.Duration    // Interval for periodic sync
 	syncTimeout   time.Duration    // Maximum duration of a remote sync attempt
@@ -1541,7 +1542,7 @@ func (f *VFSFile) Close() (closeErr error) {
 
 	// Final sync of dirty pages before closing
 	f.mu.Lock()
-	if f.writeEnabled && len(f.dirty) > 0 {
+	if f.bufferErr != nil || (f.writeEnabled && len(f.dirty) > 0) {
 		if err := f.syncToRemoteWithLock(); err != nil {
 			closeErr = fmt.Errorf("sync on close: %w", err)
 		}
@@ -1607,6 +1608,11 @@ func (f *VFSFile) ReadAt(p []byte, off int64) (n int, err error) {
 
 	// Check dirty pages first (takes priority over cache and remote)
 	f.mu.Lock()
+	if f.bufferErr != nil {
+		err := f.bufferErr
+		f.mu.Unlock()
+		return 0, err
+	}
 	if f.writeEnabled {
 		if bufferOff, ok := f.dirty[pgno]; ok {
 			// Read page from buffer file
@@ -1738,6 +1744,9 @@ func (f *VFSFile) WriteAt(b []byte, off int64) (n int, err error) {
 	if !f.writeEnabled {
 		return 0, sqlite3vfs.ReadOnlyError
 	}
+	if f.bufferErr != nil {
+		return 0, f.bufferErr
+	}
 
 	// Partial writes must preserve the rest of an existing page.
 	page := make([]byte, pageSize)
@@ -1818,6 +1827,9 @@ func (f *VFSFile) Truncate(size int64) error {
 	if !f.writeEnabled {
 		return sqlite3vfs.ReadOnlyError
 	}
+	if f.bufferErr != nil {
+		return f.bufferErr
+	}
 
 	// Remove dirty pages beyond new size
 	for pgno := range f.dirty {
@@ -1845,6 +1857,9 @@ func (f *VFSFile) Sync(flag sqlite3vfs.SyncType) error {
 
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.bufferErr != nil {
+		return f.bufferErr
+	}
 
 	// If write support is not enabled, no-op
 	if !f.writeEnabled {
@@ -1886,6 +1901,11 @@ func (f *VFSFile) SetWriteEnabled(enabled bool) error {
 //   - Starts sync ticker if syncInterval > 0 and not already running
 func (f *VFSFile) SetWriteEnabledWithTimeout(enabled bool, timeout time.Duration) error {
 	f.mu.Lock()
+	if f.bufferErr != nil {
+		err := f.bufferErr
+		f.mu.Unlock()
+		return err
+	}
 
 	// No-op if already in the requested state
 	if f.writeEnabled == enabled {
@@ -2087,6 +2107,9 @@ func (f *VFSFile) syncToRemote() error {
 // syncToRemoteWithLock syncs dirty pages to the remote replica.
 // Caller must hold f.mu.
 func (f *VFSFile) syncToRemoteWithLock() error {
+	if f.bufferErr != nil {
+		return f.bufferErr
+	}
 	// Double-check dirty pages exist
 	if len(f.dirty) == 0 {
 		return nil
@@ -2351,7 +2374,8 @@ func (f *VFSFile) writeToBuffer(pgno uint32, data []byte) error {
 
 	// Write page data (no header, just raw page data)
 	if _, err := f.bufferFile.WriteAt(data, writeOffset); err != nil {
-		return fmt.Errorf("write page to buffer: %w", err)
+		f.bufferErr = fmt.Errorf("write page to buffer: %w", err)
+		return f.bufferErr
 	}
 	if writeOffset == f.bufferNextOff {
 		f.bufferNextOff += int64(len(data))
@@ -2395,6 +2419,9 @@ func (f *VFSFile) Lock(elock sqlite3vfs.LockType) error {
 
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.bufferErr != nil {
+		return f.bufferErr
+	}
 
 	if elock < f.lockType {
 		return fmt.Errorf("invalid lock downgrade: current=%s target=%s", f.lockType, elock)
@@ -2549,6 +2576,9 @@ func (f *VFSFile) FileControl(op int, pragmaName string, pragmaValue *string) (*
 			return &result, nil
 		}
 		defer f.mu.Unlock()
+		if f.bufferErr != nil {
+			return nil, f.bufferErr
+		}
 		durable := f.expectedTXID
 		if !f.writeEnabled {
 			durable = f.pos.TXID

@@ -288,8 +288,8 @@ export LITESTREAM_SYNC_INTERVAL="1s"
 
 ### Write Mode Considerations
 
-- **Connection pooling**: Multiple connections can be opened in write mode (for example, by `database/sql`)
-- **Single writer**: Write contention is enforced at lock acquisition. If another connection already holds write intent, SQLite returns `SQLITE_BUSY`
+- **Connection pooling**: Use one writable connection for each database name in one VFS. A second writable open returns `SQLITE_BUSY`. Read-only connections can coexist.
+- **Single writer**: Applications must also prevent writer overlap between processes or hosts. The local connection check is not a distributed lease.
 - **Conflict detection**: If the remote has advanced unexpectedly, `ErrConflict` is returned
 - **Buffer durability**: Recovery uses synchronized LTX objects. A lost local buffer can lose unsynchronized writes.
 - **Sync interval**: Balance between durability (shorter) and performance (longer)
@@ -312,6 +312,21 @@ Each sync attempt has a five-second context deadline. Set a positive
 `sync_timeout` duration in the database URI to change it. Replica clients must
 honor context cancellation. A failed or timed-out upload keeps its dirty pages
 for retry and does not advance the durable transaction ID.
+
+An upload failure can have an unknown outcome. Do not automatically replay
+application mutations.
+
+### Local Buffer Errors
+
+A failed buffer write can leave a partly changed page. The connection then
+rejects reads, writes, locks, truncation, sync, and persistence confirmation.
+Close also reports the error and removes disposable local state. It does not
+upload the damaged buffer. Close the connection and reopen the database to
+recover the last synchronized state. Unsynchronized writes can be lost.
+
+SQLite does not report VFS close errors to its caller. A successful SQLite
+close is not proof of persistence. Confirm remote persistence before close
+and before reporting success to the application.
 
 ### Creating a New Database
 
