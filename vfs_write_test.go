@@ -351,6 +351,92 @@ func TestVFSFile_SyncToRemote(t *testing.T) {
 	client.mu.Unlock()
 }
 
+type syncFailureReplicaClient struct {
+	*writeTestReplicaClient
+	failReads  bool
+	failUpload bool
+}
+
+func (c *syncFailureReplicaClient) OpenLTXFile(ctx context.Context, level int, minTXID, maxTXID ltx.TXID, offset, size int64) (io.ReadCloser, error) {
+	if c.failReads {
+		return nil, errors.New("injected GET failure")
+	}
+	return c.writeTestReplicaClient.OpenLTXFile(ctx, level, minTXID, maxTXID, offset, size)
+}
+
+func (c *syncFailureReplicaClient) WriteLTXFile(ctx context.Context, level int, minTXID, maxTXID ltx.TXID, r io.Reader) (*ltx.FileInfo, error) {
+	if c.failUpload {
+		return nil, errors.New("injected PUT failure")
+	}
+	return c.writeTestReplicaClient.WriteLTXFile(ctx, level, minTXID, maxTXID, r)
+}
+
+func TestVFSFile_SyncWithoutReadAfterWrite(t *testing.T) {
+	base := newWriteTestReplicaClient()
+	createTestLTXFile(t, base, 1, DefaultPageSize, 1, map[uint32][]byte{1: make([]byte, DefaultPageSize)})
+	f := setupWriteableVFSFile(t, base)
+	if err := f.Open(); err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	client := &syncFailureReplicaClient{writeTestReplicaClient: base}
+	f.client = client
+	for txid := ltx.TXID(2); txid <= 3; txid++ {
+		data := []byte(fmt.Sprintf("transaction %d", txid))
+		if _, err := f.WriteAt(data, 0); err != nil {
+			t.Fatal(err)
+		}
+		client.failReads = true
+		if err := f.Sync(0); err != nil {
+			t.Fatal(err)
+		}
+		client.failReads = false
+		index, err := FetchPageIndex(context.Background(), base, base.ltxFiles[0][len(base.ltxFiles[0])-1])
+		if err != nil {
+			t.Fatal(err)
+		}
+		if f.expectedTXID != txid || f.index[1] != index[1] {
+			t.Fatalf("incorrect published state: txid=%s index=%v want=%v", f.expectedTXID, f.index[1], index[1])
+		}
+		f.cache.Purge()
+		got := make([]byte, DefaultPageSize)
+		if _, err := f.ReadAt(got, 0); err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(got[:len(data)], data) {
+			t.Fatalf("remote read = %q, want %q", got[:len(data)], data)
+		}
+	}
+}
+
+func TestVFSFile_SyncRetryAfterUploadFailure(t *testing.T) {
+	base := newWriteTestReplicaClient()
+	createTestLTXFile(t, base, 1, DefaultPageSize, 1, map[uint32][]byte{1: make([]byte, DefaultPageSize)})
+	f := setupWriteableVFSFile(t, base)
+	if err := f.Open(); err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	client := &syncFailureReplicaClient{writeTestReplicaClient: base, failUpload: true}
+	f.client = client
+	if _, err := f.WriteAt([]byte("retry"), 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Sync(0); err == nil {
+		t.Fatal("expected upload failure")
+	}
+	if f.expectedTXID != 1 || len(f.dirty) == 0 {
+		t.Fatal("failed upload changed durable state or discarded dirty pages")
+	}
+	client.failUpload = false
+	if err := f.Sync(0); err != nil {
+		t.Fatal(err)
+	}
+	if f.expectedTXID != 2 || len(f.dirty) != 0 {
+		t.Fatal("retry did not publish the transaction")
+	}
+}
+
 func TestVFSFile_ConflictDetection(t *testing.T) {
 	client := newWriteTestReplicaClient()
 

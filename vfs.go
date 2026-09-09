@@ -2093,20 +2093,18 @@ func (f *VFSFile) syncToRemoteWithLock() error {
 	}
 
 	// Create LTX file from dirty pages
-	ltxReader := f.createLTXFromDirty()
+	ltxReader, encodedIndex := f.createLTXFromDirty()
 
 	// Upload LTX file to remote
 	info, err := f.client.WriteLTXFile(ctx, 0, f.pendingTXID, f.pendingTXID, ltxReader)
+	// Stop the encoder if the upload did not consume the stream.
+	ltxReader.Close()
+	publishedIndex := <-encodedIndex
 	if err != nil {
 		return fmt.Errorf("upload LTX: %w", err)
 	}
-	publishedIndex, err := FetchPageIndex(ctx, f.client, info)
-	if err != nil {
-		return fmt.Errorf("fetch published LTX index: %w", err)
-	}
-	publishedHeader, err := FetchLTXHeader(ctx, f.client, info)
-	if err != nil {
-		return fmt.Errorf("fetch published LTX header: %w", err)
+	if publishedIndex == nil {
+		return fmt.Errorf("upload LTX: replica did not consume the complete transaction")
 	}
 
 	f.logger.Info("synced to remote",
@@ -2118,9 +2116,8 @@ func (f *VFSFile) syncToRemoteWithLock() error {
 	f.pendingTXID++
 	f.pos = ltx.Pos{TXID: f.expectedTXID}
 
-	// Apply the state that the replica returned. Remove pages that a truncate
-	// made invalid.
-	f.commit = publishedHeader.Commit
+	// Use the encoded index only after the bucket accepts the complete object.
+	// Remove pages that a truncate made invalid.
 	for pgno := range f.index {
 		if pgno > f.commit {
 			delete(f.index, pgno)
@@ -2198,8 +2195,9 @@ func (f *VFSFile) checkForConflict(ctx context.Context) error {
 // Returns a streaming reader for the LTX data using io.Pipe to avoid loading
 // all data into memory at once.
 // Must be called with f.mu held.
-func (f *VFSFile) createLTXFromDirty() io.Reader {
+func (f *VFSFile) createLTXFromDirty() (*io.PipeReader, <-chan map[uint32]ltx.PageIndexElem) {
 	pr, pw := io.Pipe()
+	result := make(chan map[uint32]ltx.PageIndexElem, 1)
 
 	// Sort page numbers (LTX encoder requires ordered pages)
 	pgnos := make([]uint32, 0, len(f.dirty))
@@ -2224,7 +2222,9 @@ func (f *VFSFile) createLTXFromDirty() io.Reader {
 		var err error
 		defer func() {
 			pw.CloseWithError(err)
+			close(result)
 		}()
+		index := make(map[uint32]ltx.PageIndexElem, len(pgnos))
 
 		enc, encErr := ltx.NewEncoder(pw)
 		if encErr != nil {
@@ -2261,9 +2261,16 @@ func (f *VFSFile) createLTXFromDirty() io.Reader {
 				return
 			}
 
+			offset := enc.N()
 			if err = enc.EncodePage(ltx.PageHeader{Pgno: pgno}, data); err != nil {
 				err = fmt.Errorf("encode page %d: %w", pgno, err)
 				return
+			}
+			index[pgno] = ltx.PageIndexElem{
+				MinTXID: pendingTXID,
+				MaxTXID: pendingTXID,
+				Offset:  offset,
+				Size:    enc.N() - offset,
 			}
 		}
 
@@ -2272,9 +2279,10 @@ func (f *VFSFile) createLTXFromDirty() io.Reader {
 			err = fmt.Errorf("close encoder: %w", err)
 			return
 		}
+		result <- index
 	}()
 
-	return pr
+	return pr, result
 }
 
 // initWriteBuffer initializes the write buffer file for durability.
