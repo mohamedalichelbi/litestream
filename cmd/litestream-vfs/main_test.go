@@ -550,6 +550,8 @@ done:
 }
 
 func TestVFS_HighLoadConcurrentReads(t *testing.T) {
+	const initialRows = 2000
+	const readers = 8
 	if testing.Short() {
 		t.Skip("skipping high-load test in short mode")
 	}
@@ -569,7 +571,7 @@ func TestVFS_HighLoadConcurrentReads(t *testing.T) {
 		t.Fatalf("create table: %v", err)
 	}
 
-	seedLargeTable(t, primary, 2000)
+	seedLargeTable(t, primary, initialRows)
 
 	replica := openVFSReplicaDB(t, vfsName)
 	defer replica.Close()
@@ -587,6 +589,7 @@ func TestVFS_HighLoadConcurrentReads(t *testing.T) {
 	go func() {
 		defer close(writerErr)
 		rnd := rand.New(rand.NewSource(time.Now().UnixNano()))
+		rowCount := initialRows
 		for {
 			select {
 			case <-ctx.Done():
@@ -595,22 +598,29 @@ func TestVFS_HighLoadConcurrentReads(t *testing.T) {
 			default:
 			}
 
-			switch rnd.Intn(3) {
+			action := rnd.Intn(3)
+			if rowCount == 0 {
+				action = 0
+			}
+			switch action {
 			case 0:
 				if _, err := primary.Exec("INSERT INTO t (value, updated_at) VALUES (?, strftime('%s','now'))", fmt.Sprintf("value-%d", rnd.Int())); err != nil {
 					writerErr <- err
 					return
 				}
+				rowCount++
 			case 1:
-				if _, err := primary.Exec("UPDATE t SET value = value || '-u' WHERE id IN (SELECT id FROM t ORDER BY RANDOM() LIMIT 1)"); err != nil {
+				// Select one random row without a full-table random sort.
+				if _, err := primary.Exec("UPDATE t SET value = value || '-u' WHERE id IN (SELECT id FROM t ORDER BY id LIMIT 1 OFFSET ?)", rnd.Intn(rowCount)); err != nil {
 					writerErr <- err
 					return
 				}
 			default:
-				if _, err := primary.Exec("DELETE FROM t WHERE id IN (SELECT id FROM t ORDER BY RANDOM() LIMIT 1)"); err != nil {
+				if _, err := primary.Exec("DELETE FROM t WHERE id IN (SELECT id FROM t ORDER BY id LIMIT 1 OFFSET ?)", rnd.Intn(rowCount)); err != nil {
 					writerErr <- err
 					return
 				}
+				rowCount--
 			}
 
 			writerOps.Add(1)
@@ -618,9 +628,9 @@ func TestVFS_HighLoadConcurrentReads(t *testing.T) {
 		}
 	}()
 
-	readerErrCh := make(chan error, 1)
+	readerErrCh := make(chan error, readers)
 	var readerWg sync.WaitGroup
-	for i := 0; i < 8; i++ {
+	for i := 0; i < readers; i++ {
 		readerWg.Add(1)
 		go func(id int) {
 			defer readerWg.Done()
@@ -659,7 +669,9 @@ func TestVFS_HighLoadConcurrentReads(t *testing.T) {
 	default:
 	}
 
-	if ops := writerOps.Load(); ops < 100 {
+	ops := writerOps.Load()
+	t.Logf("writes in five seconds: %d", ops)
+	if ops < 100 {
 		t.Fatalf("expected high write volume, got %d ops", ops)
 	}
 
