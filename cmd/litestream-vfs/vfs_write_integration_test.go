@@ -8,6 +8,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -784,6 +785,61 @@ func TestVFS_SchemaGrowthBeforePoll(t *testing.T) {
 	err = sqldb.QueryRow("SELECT name FROM products WHERE id = 1").Scan(&name)
 	require.NoError(t, err)
 	require.Equal(t, "Widget", name)
+}
+
+type gatedUploadClient struct {
+	litestream.ReplicaClient
+	started chan struct{}
+	release chan struct{}
+}
+
+func (c *gatedUploadClient) WriteLTXFile(ctx context.Context, level int,
+	minTXID, maxTXID ltx.TXID, r io.Reader) (*ltx.FileInfo, error) {
+	select {
+	case c.started <- struct{}{}:
+	default:
+	}
+	select {
+	case <-c.release:
+		return c.ReplicaClient.WriteLTXFile(ctx, level, minTXID, maxTXID, r)
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+func TestVFS_DurabilityStatusDuringUpload(t *testing.T) {
+	base := file.NewReplicaClient(t.TempDir())
+	setupInitialDB(t, base)
+	client := &gatedUploadClient{base, make(chan struct{}, 1), make(chan struct{})}
+	vfs := newWritableVFS(t, client, time.Second, t.TempDir())
+	vfsName := fmt.Sprintf("litestream-durability-status-%d", time.Now().UnixNano())
+	require.NoError(t, sqlite3vfs.RegisterVFS(vfsName, vfs))
+	sqldb, err := sql.Open("sqlite3", fmt.Sprintf("file:test.db?vfs=%s", vfsName))
+	require.NoError(t, err)
+	sqldb.SetMaxOpenConns(1)
+	defer sqldb.Close()
+	defer close(client.release)
+	_, err = sqldb.Exec("INSERT INTO users (id, name) VALUES (2, 'Bob')")
+	require.NoError(t, err)
+	select {
+	case <-client.started:
+	case <-time.After(3 * time.Second):
+		t.Fatal("upload did not start")
+	}
+	result := make(chan string, 1)
+	go func() {
+		var status string
+		if err := sqldb.QueryRow("PRAGMA litestream_durability_status").Scan(&status); err != nil {
+			status = err.Error()
+		}
+		result <- status
+	}()
+	select {
+	case status := <-result:
+		require.Equal(t, "busy", status)
+	case <-time.After(time.Second):
+		t.Fatal("SQLite status query blocked behind upload")
+	}
 }
 
 func TestVFS_DurabilityTicket(t *testing.T) {

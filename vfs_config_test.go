@@ -13,6 +13,28 @@ import (
 	"time"
 )
 
+func TestVFSConfig_SyncTimeout(t *testing.T) {
+	for _, value := range []string{"0s", "-1s", "invalid"} {
+		if _, err := ParseVFSURIConfig(map[string]string{"sync_timeout": value}); err == nil {
+			t.Fatalf("accepted invalid sync timeout %q", value)
+		}
+	}
+	cfg, err := ParseVFSURIConfig(map[string]string{"sync_timeout": "2s"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	merged := MergeVFSConfig(&VFSConfig{}, cfg)
+	*cfg.SyncTimeout = time.Second
+	if *merged.SyncTimeout != 2*time.Second {
+		t.Fatal("merged timeout aliases the input")
+	}
+	copy := cloneVFSConfig(merged)
+	*merged.SyncTimeout = time.Second
+	if *copy.SyncTimeout != 2*time.Second {
+		t.Fatal("copied timeout aliases the input")
+	}
+}
+
 func TestVFSConfig_SetGet(t *testing.T) {
 	defer clearVFSConfigs()
 

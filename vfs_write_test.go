@@ -14,6 +14,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -21,6 +22,44 @@ import (
 
 	"github.com/psanford/sqlite3vfs"
 )
+
+func TestVFSFile_DurabilityStatus(t *testing.T) {
+	f := &VFSFile{
+		logger: slog.Default(), writeEnabled: true,
+		expectedTXID: 9, pendingTXID: 10,
+		pos: ltx.Pos{TXID: 11}, dirty: map[uint32]int64{1: 0},
+	}
+	status, err := f.FileControl(14, "litestream_durability_status", nil)
+	if err != nil || status == nil || *status != "0000000000000009:000000000000000a" {
+		t.Fatalf("dirty status: %v, %v", status, err)
+	}
+	clear(f.dirty)
+	status, err = f.FileControl(14, "litestream_durability_status", nil)
+	if err != nil || status == nil || *status != "0000000000000009:0000000000000009" {
+		t.Fatalf("clean status: %v, %v", status, err)
+	}
+	value := "1"
+	if _, err := f.FileControl(14, "litestream_durability_status", &value); err == nil {
+		t.Fatal("durability status must be read-only")
+	}
+	f.mu.Lock()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		status, err := f.FileControl(14, "litestream_durability_status", nil)
+		if err != nil || status == nil || *status != "busy" {
+			t.Errorf("locked status: %v, %v", status, err)
+		}
+	}()
+	select {
+	case <-done:
+		f.mu.Unlock()
+	case <-time.After(time.Second):
+		f.mu.Unlock()
+		<-done
+		t.Fatal("durability status blocked behind the file mutex")
+	}
+}
 
 // writeTestReplicaClient is a mock ReplicaClient for testing write functionality.
 type writeTestReplicaClient struct {
@@ -322,6 +361,50 @@ func TestVFSFile_BuildIndexAppliesTruncation(t *testing.T) {
 	}
 	if len(index) != 1 || index[1].MaxTXID != lastTXID || f.commit != 1 {
 		t.Fatalf("incorrect truncated index: commit=%d, index=%v", f.commit, index)
+	}
+}
+
+type timeoutUploadClient struct {
+	*writeTestReplicaClient
+	blocked atomic.Bool
+}
+
+func (c *timeoutUploadClient) WriteLTXFile(ctx context.Context, level int,
+	minTXID, maxTXID ltx.TXID, r io.Reader) (*ltx.FileInfo, error) {
+	if c.blocked.Load() {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+	return c.writeTestReplicaClient.WriteLTXFile(ctx, level, minTXID, maxTXID, r)
+}
+
+func TestVFSFile_SyncTimeoutKeepsDirtyPages(t *testing.T) {
+	base := newWriteTestReplicaClient()
+	createTestLTXFile(t, base, 1, 4096, 1, map[uint32][]byte{1: make([]byte, 4096)})
+	client := &timeoutUploadClient{writeTestReplicaClient: base}
+	client.blocked.Store(true)
+	f := setupWriteableVFSFile(t, base)
+	f.client = client
+	f.syncTimeout = 20 * time.Millisecond
+	if err := f.Open(); err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	if _, err := f.WriteAt([]byte("pending"), 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Sync(0); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("expected sync deadline, got %v", err)
+	}
+	if len(f.dirty) == 0 || f.expectedTXID != 1 {
+		t.Fatal("timed-out upload advanced durability or discarded dirty pages")
+	}
+	client.blocked.Store(false)
+	if err := f.Sync(0); err != nil {
+		t.Fatal(err)
+	}
+	if len(f.dirty) != 0 || f.expectedTXID != 2 {
+		t.Fatal("retry did not publish the pending pages")
 	}
 }
 

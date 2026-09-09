@@ -28,6 +28,13 @@ go test -tags='vfs,SQLITE3VFS_LOADABLE_EXT' .
 go test -tags=vfs ./cmd/litestream-vfs
 '''
 
+[tasks.vfs-durability-test]
+description = "Check non-blocking durability status through the VFS and SQLite binding."
+run = '''
+go test -race -tags='vfs,SQLITE3VFS_LOADABLE_EXT' -run '^TestVFSFile_DurabilityStatus$' -count=1 -timeout=30s .
+go test -race -tags=vfs -run '^TestVFS_DurabilityStatusDuringUpload$' -count=1 -timeout=30s ./cmd/litestream-vfs
+'''
+
 [tasks.vfs-build-linux-amd64]
 description = "Build the Linux AMD64 writable VFS extension."
 run = '''

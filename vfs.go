@@ -30,9 +30,10 @@ import (
 )
 
 const (
-	DefaultPollInterval = 1 * time.Second
-	DefaultCacheSize    = 10 * 1024 * 1024 // 10MB
-	DefaultPageSize     = 4096             // SQLite default page size
+	DefaultPollInterval   = 1 * time.Second
+	DefaultVFSSyncTimeout = 5 * time.Second
+	DefaultCacheSize      = 10 * 1024 * 1024 // 10MB
+	DefaultPageSize       = 4096             // SQLite default page size
 
 	pageFetchRetryAttempts = 6
 	pageFetchRetryDelay    = 15 * time.Millisecond
@@ -189,6 +190,9 @@ func (vfs *VFS) openMainDB(name string, uriParameters map[string]string, flags s
 	f.perConnClient = perConnClient
 
 	if cfg != nil {
+		if cfg.SyncTimeout != nil {
+			f.syncTimeout = *cfg.SyncTimeout
+		}
 		if cfg.PollInterval != nil {
 			f.PollInterval = *cfg.PollInterval
 		}
@@ -659,6 +663,7 @@ type VFSFile struct {
 	bufferNextOff int64            // Next write offset in buffer file
 	syncTicker    *time.Ticker     // Ticker for periodic sync
 	syncInterval  time.Duration    // Interval for periodic sync
+	syncTimeout   time.Duration    // Maximum duration of a remote sync attempt
 	syncStop      chan struct{}    // Signal to stop sync loop
 	inTransaction bool             // True during active write transaction
 	disabling     bool             // True when write disable is in progress
@@ -2090,7 +2095,12 @@ func (f *VFSFile) syncToRemoteWithLock() error {
 		}
 	}
 
-	ctx := f.ctx
+	timeout := f.syncTimeout
+	if timeout <= 0 {
+		timeout = DefaultVFSSyncTimeout
+	}
+	ctx, cancel := context.WithTimeout(f.ctx, timeout)
+	defer cancel()
 
 	// Check for conflicts
 	if err := f.checkForConflict(ctx); err != nil {
@@ -2521,6 +2531,27 @@ func (f *VFSFile) FileControl(op int, pragmaName string, pragmaValue *string) (*
 	f.logger.Debug("file control", "pragma", name, "value", pragmaValue)
 
 	switch name {
+	case "litestream_durability_status":
+		if pragmaValue != nil {
+			return nil, fmt.Errorf("litestream_durability_status is read-only")
+		}
+		// Confirmation must not block SQLite's caller behind remote I/O.
+		if !f.mu.TryLock() {
+			result := "busy"
+			return &result, nil
+		}
+		defer f.mu.Unlock()
+		durable := f.expectedTXID
+		if !f.writeEnabled {
+			durable = f.pos.TXID
+		}
+		ticket := durable
+		if len(f.dirty) != 0 {
+			ticket = f.pendingTXID
+		}
+		result := durable.String() + ":" + ticket.String()
+		return &result, nil
+
 	case "litestream_txid":
 		if pragmaValue != nil {
 			return nil, fmt.Errorf("litestream_txid is read-only")

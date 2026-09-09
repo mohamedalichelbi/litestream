@@ -15,6 +15,7 @@ type VFSConfig struct {
 	ReplicaURL       string
 	WriteEnabled     *bool
 	SyncInterval     *time.Duration
+	SyncTimeout      *time.Duration
 	BufferPath       string
 	HydrationEnabled *bool
 	HydrationPath    string
@@ -31,6 +32,7 @@ var vfsURIConfigKeys = [...]string{
 	"replica_url",
 	"write_enabled",
 	"sync_interval",
+	"sync_timeout",
 	"buffer_path",
 	"hydration_enabled",
 	"hydration_path",
@@ -69,6 +71,12 @@ func (cfg *VFSConfig) Set(key, value string) error {
 			return fmt.Errorf("invalid sync_interval: %w", err)
 		}
 		cfg.SyncInterval = &d
+	case "sync_timeout":
+		d, err := time.ParseDuration(value)
+		if err != nil || d <= 0 {
+			return fmt.Errorf("sync_timeout must be a positive duration: %q", value)
+		}
+		cfg.SyncTimeout = &d
 	case "buffer_path":
 		cfg.BufferPath = value
 	case "hydration_enabled":
@@ -139,6 +147,10 @@ func MergeVFSConfig(base, override *VFSConfig) *VFSConfig {
 		v := *override.SyncInterval
 		merged.SyncInterval = &v
 	}
+	if override.SyncTimeout != nil {
+		v := *override.SyncTimeout
+		merged.SyncTimeout = &v
+	}
 	if override.BufferPath != "" {
 		merged.BufferPath = override.BufferPath
 	}
@@ -172,6 +184,10 @@ func cloneVFSConfig(cfg *VFSConfig) *VFSConfig {
 	if cfg.SyncInterval != nil {
 		v := *cfg.SyncInterval
 		copied.SyncInterval = &v
+	}
+	if cfg.SyncTimeout != nil {
+		v := *cfg.SyncTimeout
+		copied.SyncTimeout = &v
 	}
 	if cfg.HydrationEnabled != nil {
 		v := *cfg.HydrationEnabled

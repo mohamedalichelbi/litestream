@@ -280,7 +280,7 @@ export LITESTREAM_SYNC_INTERVAL="1s"
 
 ### How Write Mode Works
 
-1. Writes are captured to a local buffer file for durability
+1. Writes enter a disposable local buffer
 2. Dirty pages are tracked in memory
 3. Periodically (or on close), dirty pages are packaged into an LTX file
 4. The LTX file is uploaded to remote storage
@@ -291,9 +291,27 @@ export LITESTREAM_SYNC_INTERVAL="1s"
 - **Connection pooling**: Multiple connections can be opened in write mode (for example, by `database/sql`)
 - **Single writer**: Write contention is enforced at lock acquisition. If another connection already holds write intent, SQLite returns `SQLITE_BUSY`
 - **Conflict detection**: If the remote has advanced unexpectedly, `ErrConflict` is returned
-- **Buffer durability**: The local buffer file provides crash recovery for uncommitted writes
+- **Buffer durability**: Recovery uses synchronized LTX objects. A lost local buffer can lose unsynchronized writes.
 - **Sync interval**: Balance between durability (shorter) and performance (longer)
 - **New databases**: Write mode can create new databases from scratch if no LTX files exist
+
+### Confirming Remote Persistence
+
+`PRAGMA litestream_durability_status` returns `durable:ticket`, with each ID as
+16 hexadecimal digits. In write mode, `durable` is the last locally published
+transaction, not a newer transaction observed from another writer. `ticket`
+includes the current dirty pages. Save the ticket and wait until a later status
+reports a durable ID at least as large before reporting remote persistence.
+
+The result is `busy` if another VFS operation holds the file mutex. This query
+does not wait for that mutex. Callers must retry with a bounded wait and report
+failure if they cannot confirm persistence. Other SQLite operations can still
+wait for remote I/O.
+
+Each sync attempt has a five-second context deadline. Set a positive
+`sync_timeout` duration in the database URI to change it. Replica clients must
+honor context cancellation. A failed or timed-out upload keeps its dirty pages
+for retry and does not advance the durable transaction ID.
 
 ### Creating a New Database
 
