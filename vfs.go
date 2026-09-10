@@ -4,6 +4,7 @@
 package litestream
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"errors"
@@ -37,6 +38,8 @@ const (
 
 	pageFetchRetryAttempts = 6
 	pageFetchRetryDelay    = 15 * time.Millisecond
+	readAheadPages         = 4
+	readAheadBytes         = 256 * 1024
 )
 
 // ErrConflict is returned when the remote replica has newer transactions than expected.
@@ -1678,7 +1681,7 @@ func (f *VFSFile) ReadAt(p []byte, off int64) (n int, err error) {
 	var lastErr error
 	ctx := f.ctx
 	for attempt := 0; attempt < pageFetchRetryAttempts; attempt++ {
-		_, data, lastErr = FetchPage(ctx, f.client, elem.Level, elem.MinTXID, elem.MaxTXID, elem.Offset, elem.Size)
+		data, lastErr = f.fetchPageRange(ctx, pgno, elem)
 		if lastErr == nil {
 			break
 		}
@@ -1718,6 +1721,65 @@ func (f *VFSFile) ReadAt(p []byte, off int64) (n int, err error) {
 	}
 
 	return n, nil
+}
+
+// fetchPageRange combines adjacent frames from one immutable LTX object.
+// Read-ahead uses the existing page cache and never writes a local database.
+func (f *VFSFile) fetchPageRange(ctx context.Context, pgno uint32, first ltx.PageIndexElem) ([]byte, error) {
+	if first.Size <= 0 || first.Offset < 0 {
+		return nil, fmt.Errorf("invalid LTX page range")
+	}
+	elems := []ltx.PageIndexElem{first}
+	size := first.Size
+	f.mu.Lock()
+	pageSize := f.pageSize
+	limit := min(readAheadPages, max(1, f.CacheSize/int(pageSize)))
+	for next := pgno + 1; next > pgno && next <= f.commit && len(elems) < limit; next++ {
+		elem, ok := f.index[next]
+		_, dirty := f.dirty[next]
+		if !ok || dirty || f.cache.Contains(next) || elem.Level != first.Level || elem.MinTXID != first.MinTXID || elem.MaxTXID != first.MaxTXID || elem.Offset != first.Offset+size || elem.Size <= 0 || elem.Size > readAheadBytes-size {
+			break
+		}
+		elems = append(elems, elem)
+		size += elem.Size
+	}
+	f.mu.Unlock()
+	if len(elems) == 1 {
+		_, data, err := FetchPage(ctx, f.client, first.Level, first.MinTXID, first.MaxTXID, first.Offset, first.Size)
+		return data, err
+	}
+	r, err := f.client.OpenLTXFile(ctx, first.Level, first.MinTXID, first.MaxTXID, first.Offset, size)
+	if err != nil {
+		return nil, err
+	}
+	defer r.Close()
+	b, err := io.ReadAll(io.LimitReader(r, size))
+	if err != nil {
+		return nil, err
+	} else if int64(len(b)) != size {
+		return nil, io.ErrUnexpectedEOF
+	}
+	pages := make([][]byte, len(elems))
+	var offset int64
+	for i, elem := range elems {
+		hdr, data, err := ltx.DecodePageData(b[offset : offset+elem.Size])
+		if err != nil {
+			return nil, err
+		} else if hdr.Pgno != pgno+uint32(i) || len(data) != int(pageSize) {
+			return nil, fmt.Errorf("invalid page in LTX read-ahead: %d", hdr.Pgno)
+		}
+		pages[i] = bytes.Clone(data)
+		offset += elem.Size
+	}
+	f.mu.Lock()
+	for i := 1; i < len(elems); i++ {
+		next := pgno + uint32(i)
+		if current, ok := f.index[next]; ok && current == elems[i] {
+			f.cache.Add(next, pages[i])
+		}
+	}
+	f.mu.Unlock()
+	return pages[0], nil
 }
 
 func (f *VFSFile) WriteAt(b []byte, off int64) (n int, err error) {
