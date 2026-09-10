@@ -163,5 +163,10 @@ func FetchPage(ctx context.Context, client ReplicaClient, level int, minTXID, ma
 	if err != nil {
 		return ltx.PageHeader{}, nil, fmt.Errorf("read ltx page frame: %w", err)
 	}
-	return ltx.DecodePageData(b)
+	hdr, data, err := ltx.DecodePageData(b)
+	// The decoder reserves 64 KiB. Do not retain that allocation for a smaller page.
+	if cap(data) > len(data) {
+		data = bytes.Clone(data)
+	}
+	return hdr, data, err
 }

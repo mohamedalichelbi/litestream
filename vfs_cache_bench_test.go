@@ -11,6 +11,23 @@ import (
 	"time"
 )
 
+func TestVFSFileCachePageAllocation(t *testing.T) {
+	client := newMockReplicaClient()
+	client.addFixture(t, buildLTXFixture(t, 1, 'a'))
+	f := NewVFSFile(client, "cache.db", slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err := f.Open(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = f.Close() })
+	if _, err := f.ReadAt(make([]byte, DefaultPageSize), 0); err != nil {
+		t.Fatal(err)
+	}
+	page, ok := f.cache.Get(1)
+	if !ok || len(page) != DefaultPageSize || cap(page) != DefaultPageSize {
+		t.Fatalf("cached page: found=%v length=%d capacity=%d, want %d bytes", ok, len(page), cap(page), DefaultPageSize)
+	}
+}
+
 func BenchmarkVFSFileIdleDatabases(b *testing.B) {
 	for _, count := range []int{100, 1000} {
 		b.Run(fmt.Sprint(count), func(b *testing.B) {
