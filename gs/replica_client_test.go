@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"io"
+	"slices"
 	"testing"
 	"time"
 
@@ -77,5 +78,44 @@ func TestReplicaClient_OpenLTXFileReadsFullObject(t *testing.T) {
 
 	if !bytes.Equal(out, data) {
 		t.Fatalf("unexpected replica content: got %q, want %q", out, data)
+	}
+}
+
+func TestReplicaClient_LTXFilesSeek(t *testing.T) {
+	rc, server := setupTestClient(t)
+	defer server.Stop()
+	ctx := context.Background()
+	for _, txid := range []ltx.TXID{1, 3, 7} {
+		data := ltxTestData(t, txid, txid, nil)
+		if _, err := rc.WriteLTXFile(ctx, 0, txid, txid, bytes.NewReader(data)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, tt := range []struct {
+		seek ltx.TXID
+		want []ltx.TXID
+	}{
+		{0, []ltx.TXID{1, 3, 7}},
+		{1, []ltx.TXID{1, 3, 7}},
+		{2, []ltx.TXID{3, 7}},
+		{3, []ltx.TXID{3, 7}},
+		{8, nil},
+	} {
+		t.Run(tt.seek.String(), func(t *testing.T) {
+			itr, err := rc.LTXFiles(ctx, 0, tt.seek, false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var got []ltx.TXID
+			for itr.Next() {
+				got = append(got, itr.Item().MinTXID)
+			}
+			if err := itr.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if !slices.Equal(got, tt.want) {
+				t.Fatalf("seek %s: got %v, want %v", tt.seek, got, tt.want)
+			}
+		})
 	}
 }
